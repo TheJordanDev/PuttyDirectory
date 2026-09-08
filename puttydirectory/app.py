@@ -9,8 +9,9 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from . import launcher, tray as tray_module
-from .dialogs import NodeDialog, SettingsDialog
+from .dialogs import ImportPuttyDialog, NodeDialog, SettingsDialog
 from .model import FOLDER, SESSION, Directory, Node, resolve, walk
+from . import puttyimport
 from .preferences import Preferences
 from .store import Store, StoreError
 
@@ -104,6 +105,7 @@ class App:
         edit_menu = tk.Menu(menu, tearoff=0)
         edit_menu.add_command(label="New session", accelerator="Ctrl+N", command=self.add_session)
         edit_menu.add_command(label="New folder", accelerator="Ctrl+Shift+N", command=self.add_folder)
+        edit_menu.add_command(label="Import from PuTTY...", command=self.import_from_putty)
         edit_menu.add_separator()
         edit_menu.add_command(label="Edit", accelerator="F2", command=self.edit_selected)
         edit_menu.add_command(label="Duplicate", accelerator="Ctrl+D", command=self.duplicate_selected)
@@ -336,6 +338,65 @@ class App:
             ancestor.expanded = True
         self.save()
         self.refresh(select=node.id)
+
+    def import_from_putty(self) -> None:
+        """Copy sessions out of PuTTY's own store into the open directory.
+
+        Read-only towards PuTTY: nothing is removed or changed on its side.
+        """
+        if not self._require_file():
+            return
+
+        sessions = puttyimport.read_sessions()
+        if not sessions:
+            messagebox.showinfo(
+                "Import from PuTTY",
+                "No saved PuTTY sessions found.\n\nLooked in:\n"
+                f"{puttyimport.where_it_looked()}\n\n"
+                "Sessions you have only typed into PuTTY without saving are not "
+                "stored anywhere, so there is nothing to import.",
+                parent=self.root,
+            )
+            return
+
+        siblings, ancestors = self.directory.container_for(self.selected_id())
+        where = "/".join(node.name for node in ancestors) or self.store.path.name
+        existing = {node.name for node in self.directory.all_nodes()}
+
+        answer = ImportPuttyDialog(self.root, sessions, existing, where).show()
+        if answer is None:
+            return
+        chosen, folder_name, keep_reference = answer
+
+        destination = siblings
+        if folder_name:
+            folder = Node(type=FOLDER, name=self._unique_name(folder_name, siblings))
+            siblings.append(folder)
+            destination = folder.children
+
+        first = None
+        for session in chosen:
+            node = session.to_node(keep_putty_session=keep_reference)
+            node.name = self._unique_name(node.name, destination)
+            destination.append(node)
+            first = first or node
+
+        for ancestor in ancestors:
+            ancestor.expanded = True
+        self.save()
+        self.refresh(select=first.id if first else None)
+        self.status.set(f"Imported {len(chosen)} session(s) from PuTTY")
+
+    @staticmethod
+    def _unique_name(name: str, siblings: list[Node]) -> str:
+        """Avoid colliding with a sibling, the way a file manager would."""
+        taken = {node.name for node in siblings}
+        if name not in taken:
+            return name
+        index = 2
+        while f"{name} ({index})" in taken:
+            index += 1
+        return f"{name} ({index})"
 
     def edit_selected(self) -> None:
         node_id = self.selected_id()

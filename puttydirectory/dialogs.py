@@ -215,3 +215,121 @@ class SettingsDialog(ModalDialog):
         self.result = self.settings
         self.destroy()
 
+
+
+class ImportPuttyDialog(ModalDialog):
+    """Pick which of PuTTY's saved sessions to copy in.
+
+    Read-only with respect to PuTTY: importing never removes or edits anything
+    on PuTTY's side, it only copies settings across.
+    """
+
+    def __init__(self, parent: tk.Misc, sessions: list, existing_names: set[str],
+                 destination: str):
+        super().__init__(parent, "Import from PuTTY")
+        self.resizable(True, True)
+        self.sessions = sessions
+        self.existing = existing_names
+
+        body = ttk.Frame(self, padding=12)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(1, weight=1)
+
+        ttk.Label(
+            body,
+            text=f"These stay in PuTTY - importing only copies them here.\n"
+                 f"Importing into: {destination}",
+            justify="left",
+            foreground="#555555",
+        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+
+        columns = ("user", "host", "port", "status")
+        self.tree = ttk.Treeview(body, columns=columns, show="headings",
+                                 selectmode="extended", height=12)
+        for key, title, width in (
+            ("user", "User", 110), ("host", "Host", 190),
+            ("port", "Port", 55), ("status", "", 150),
+        ):
+            self.tree.heading(key, text=title, anchor="w")
+            self.tree.column(key, width=width, stretch=(key == "host"))
+        # The name needs the tree column so long names are not truncated.
+        self.tree.configure(show="tree headings")
+        self.tree.heading("#0", text="PuTTY session", anchor="w")
+        self.tree.column("#0", width=200, stretch=True)
+
+        scroll = ttk.Scrollbar(body, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+        self.tree.grid(row=1, column=0, sticky="nsew")
+        scroll.grid(row=1, column=1, sticky="ns")
+        self.tree.tag_configure("exists", foreground="#999999")
+
+        preselect = []
+        for index, session in enumerate(sessions):
+            already = session.name in existing_names
+            status = "already in this file" if already else (
+                "via -load" if session.needs_load else "")
+            item = self.tree.insert(
+                "", "end", iid=str(index), text=session.name,
+                values=(session.user, session.host, session.port, status),
+                tags=("exists",) if already else (),
+            )
+            if not already:
+                preselect.append(item)
+        if preselect:
+            self.tree.selection_set(preselect)
+
+        buttons = ttk.Frame(body)
+        buttons.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Button(buttons, text="Select all", command=self._select_all).pack(side="left")
+        ttk.Button(buttons, text="Select none", command=self._select_none).pack(
+            side="left", padx=(4, 0))
+        self.count = tk.StringVar()
+        ttk.Label(buttons, textvariable=self.count, foreground="#555555").pack(
+            side="left", padx=(10, 0))
+
+        options = ttk.Frame(body)
+        options.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+
+        self.folder_var = tk.BooleanVar(value=len(sessions) > 3)
+        ttk.Checkbutton(options, text="Group them in a new folder named:",
+                        variable=self.folder_var).pack(side="left")
+        self.folder_name = tk.StringVar(value="PuTTY")
+        ttk.Entry(options, textvariable=self.folder_name, width=18).pack(side="left", padx=(6, 0))
+
+        self.keep_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            body,
+            text="Also keep a reference to the original PuTTY session (-load), so "
+                 "its terminal\nand appearance settings apply too",
+            variable=self.keep_var,
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        actions = ttk.Frame(body)
+        actions.grid(row=5, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        ttk.Button(actions, text="Cancel", command=self.on_cancel).pack(side="right")
+        self.import_button = ttk.Button(actions, text="Import", command=self.on_import)
+        self.import_button.pack(side="right", padx=(0, 6))
+
+        self.tree.bind("<<TreeviewSelect>>", lambda _e: self._update_count())
+        self._update_count()
+        self.minsize(640, 420)
+
+    def _select_all(self) -> None:
+        self.tree.selection_set(self.tree.get_children())
+
+    def _select_none(self) -> None:
+        self.tree.selection_remove(self.tree.selection())
+
+    def _update_count(self) -> None:
+        chosen = len(self.tree.selection())
+        self.count.set(f"{chosen} of {len(self.sessions)} selected")
+        self.import_button.configure(state="normal" if chosen else "disabled")
+
+    def on_import(self) -> None:
+        chosen = [self.sessions[int(item)] for item in self.tree.selection()]
+        if not chosen:
+            return
+        folder = self.folder_name.get().strip() if self.folder_var.get() else ""
+        self.result = (chosen, folder, bool(self.keep_var.get()))
+        self.destroy()

@@ -122,6 +122,51 @@ its own sessions you connected to most recently.
 An older flat `{"entries": [...]}` file is migrated to the tree format the first
 time it is loaded.
 
+## Importing from PuTTY
+
+*Edit > Import from PuTTY...* lists the sessions PuTTY already has and lets you
+pick any number of them (click, ctrl-click, shift-click, or **Select all**).
+
+**Nothing is removed from PuTTY.** The import only reads PuTTY's store and
+copies what it finds; your PuTTY sessions carry on working exactly as before.
+
+It works on both platforms:
+
+| Platform | Where it reads |
+| --- | --- |
+| Windows | `HKCU\Software\SimonTatham\PuTTY\Sessions` (registry) |
+| Linux / Unix | `$PUTTYDIR/sessions`, then `${XDG_CONFIG_HOME:-~/.config}/putty/sessions`, then `~/.putty/sessions` |
+
+`putty(1)` documents `~/.putty/sessions`, and that is what a stock build uses.
+The other two are checked as well, because betting on one path means silently
+importing nothing if a distro or build differs - searching all three costs
+nothing. The first directory holding a given session name wins, and the
+"nothing found" message lists every path it tried.
+
+On Unix each session is a file of `Key=Value` lines; on Windows it is a registry
+key. Either way the same fields are read.
+
+Two details it handles that a naive copy would get wrong:
+
+- **Session names are escaped** by PuTTY's `mungestr`, so `Homelab - Ubuntu` is
+  stored as `Homelab%20-%20Ubuntu`. Names are decoded on the way in.
+- **The user is usually inside the host**. If you type `jordan@server` into
+  PuTTY's Host Name box, PuTTY stores exactly that and leaves `UserName` empty.
+  The import splits it back into separate user and host fields, so folder
+  inheritance can override the user later.
+
+Port 22 is dropped rather than written out, so an imported session still picks up
+a port set on a parent folder. Sessions whose name already exists get a `(2)`
+suffix rather than overwriting anything, and ones already imported are shown
+greyed out and left unselected.
+
+Optionally the import can **group everything into a new folder** (on by default
+past three sessions), and can **keep a `-load` reference** to the original PuTTY
+session so its terminal and appearance settings apply too. That reference is off
+by default, because it makes the entry depend on the PuTTY session continuing to
+exist. A session with no host of its own always keeps the reference, since that
+is the only way it can connect.
+
 ## Folders and inheritance
 
 Folders nest arbitrarily deep, which is the point: `Client / Project / Staging /
