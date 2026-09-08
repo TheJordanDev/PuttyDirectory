@@ -24,8 +24,15 @@ ICON = ROOT / "assets" / "icon.ico"
 # them would make PyInstaller drag in PyGObject whenever it happens to be
 # installed, which bloats the bundle and is notoriously fragile to freeze. So we
 # include only backends that actually import here, preferring the one set in
-# PYSTRAY_BACKEND. _xorg needs python-xlib, which is a plain pip package and
-# freezes cleanly - it is the reliable choice for a portable Linux build.
+# PYSTRAY_BACKEND.
+#
+# Note that on Linux pystray is only the *fallback* now: the tray normally runs
+# on puttydirectory/sni.py, which speaks StatusNotifierItem over D-Bus and needs
+# nothing from this list (jeepney is a plain import PyInstaller finds by itself).
+# pystray still covers Windows, macOS, and the older XEmbed panels with no SNI
+# host - see README-BUILD.md.
+
+
 def _installed(module: str) -> bool:
     """Is a top-level module importable?
 

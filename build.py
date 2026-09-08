@@ -55,16 +55,30 @@ def write_desktop_entry(binary: Path) -> Path:
     shutil.copyfile(ASSETS / "icon.png", dist / "puttydirectory.png")
 
     path = dist / "puttydirectory.desktop"
+    # Exec has no --tray: launching from the app menu should show the window.
+    # install-linux.sh adds --tray to the autostart copy, which does want to
+    # come up hidden. Categories lists one main category only - Network and
+    # Utility both being main categories makes the app appear twice in the menu.
+    # StartupWMClass matches Tk's WM_CLASS so the panel groups the window under
+    # this entry instead of a second, iconless task.
     path.write_text(
         f"""[Desktop Entry]
 Type=Application
 Name=PuTTY Directory
+GenericName=SSH Session Manager
 Comment=Organise and launch PuTTY sessions from the tray
-Exec={binary} --tray
+Exec={binary}
 Icon=puttydirectory
 Terminal=false
-Categories=Network;RemoteAccess;Utility;
-StartupNotify=false
+Categories=Network;RemoteAccess;
+Keywords=putty;ssh;terminal;session;remote;
+StartupNotify=true
+StartupWMClass=PuttyDirectory
+Actions=Tray;
+
+[Desktop Action Tray]
+Name=Start hidden in the tray
+Exec={binary} --tray
 """,
         encoding="utf-8",
     )

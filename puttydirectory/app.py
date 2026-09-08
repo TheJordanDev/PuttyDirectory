@@ -8,7 +8,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from . import launcher, tray as tray_module
+from . import launcher, scaling, tray as tray_module
 from .dialogs import ImportPuttyDialog, NodeDialog, SettingsDialog
 from .model import FOLDER, SESSION, Directory, Node, resolve, walk
 from . import puttyimport
@@ -16,6 +16,16 @@ from .preferences import Preferences
 from .store import Store, StoreError
 
 DRAG_THRESHOLD = 6  # pixels before a click counts as a drag
+
+#: Window and column sizes as designed at 100%; everything else is derived from
+#: these by UiScale, so there is one place to change a default.
+BASE_WINDOW = (760, 520)
+BASE_MINSIZE = (520, 320)
+BASE_COLUMNS = {"#0": 240, "host": 180, "user": 110, "port": 55, "notes": 160}
+
+#: The tree draws folder rows in bold. It has to be a named font so the scaler
+#: can resize it with everything else.
+FOLDER_FONT = "PuttyDirectoryFolderFont"
 
 
 class App:
@@ -38,8 +48,24 @@ class App:
         self._dragging = False
 
         root.title("PuTTY Directory")
-        root.geometry("760x520")
-        root.minsize(520, 320)
+
+        # Scale before any widget is built, so the first layout is already the
+        # right size rather than being resized out from under the user. The
+        # factor is an app preference, not a per-directory one.
+        self.style = ttk.Style()
+        # The expander triangle is sized in raw pixels by the theme, so it needs
+        # scaling like any other pixel measurement. Read the theme's own value
+        # as the 100% baseline rather than guessing one.
+        try:
+            self._base_indicator = int(self.style.lookup("Treeview.Item", "indicatorsize") or 9)
+        except (tk.TclError, ValueError):
+            self._base_indicator = 9
+        self.scale = scaling.UiScale(root)
+        self.scale.apply(self.prefs.get("ui_scale", 1.0))
+        self.scale_var = tk.DoubleVar(value=self.scale.factor)
+        root.geometry(self.scale.geometry(*BASE_WINDOW))
+        root.minsize(*self.scale.dims(*BASE_MINSIZE))
+
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._set_window_icon()
 
@@ -122,6 +148,22 @@ class App:
         session_menu.add_command(label="Show command line", command=self.show_command)
         menu.add_cascade(label="Session", menu=session_menu)
 
+        view_menu = tk.Menu(menu, tearoff=0)
+        view_menu.add_command(label="Larger", accelerator="Ctrl++",
+                              command=lambda: self.nudge_scale(scaling.STEP))
+        view_menu.add_command(label="Smaller", accelerator="Ctrl+-",
+                              command=lambda: self.nudge_scale(-scaling.STEP))
+        view_menu.add_command(label="Reset to 100%", accelerator="Ctrl+0",
+                              command=lambda: self.set_scale(1.0))
+        view_menu.add_separator()
+        for preset in scaling.PRESETS:
+            view_menu.add_radiobutton(
+                label=f"{preset:.0%}", value=preset, variable=self.scale_var,
+                command=lambda value=preset: self.set_scale(value),
+            )
+        menu.add_cascade(label="View", menu=view_menu)
+        self.view_menu = view_menu
+
         self.root.config(menu=menu)
 
     def _build_toolbar(self) -> None:
@@ -161,19 +203,21 @@ class App:
         self.tree.heading("user", text="User", anchor="w")
         self.tree.heading("port", text="Port", anchor="w")
         self.tree.heading("notes", text="Notes", anchor="w")
-        self.tree.column("#0", width=240, stretch=True)
-        self.tree.column("host", width=180, stretch=True)
-        self.tree.column("user", width=110, stretch=False)
-        self.tree.column("port", width=55, stretch=False, anchor="e")
-        self.tree.column("notes", width=160, stretch=True)
+        for column in BASE_COLUMNS:
+            self.tree.column(column, stretch=column not in ("user", "port"),
+                             **({"anchor": "e"} if column == "port" else {}))
 
         scroll = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll.set)
         self.tree.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
 
-        bold = ("TkDefaultFont", 9, "bold")
-        self.tree.tag_configure(FOLDER, font=bold)
+        # Derived from the default font rather than hardcoded, so it follows both
+        # the system font and the UI scale.
+        self.tree.tag_configure(
+            FOLDER, font=self.scale.derive(FOLDER_FONT, weight="bold")
+        )
+        self._apply_tree_metrics()
         self.tree.tag_configure("inherited", foreground="#7a7a7a")
         self.tree.tag_configure("drop", background="#cfe4ff")
 
@@ -221,6 +265,14 @@ class App:
             "<Control-Down>": lambda e: self.move_selected(1),
             "<Control-Right>": lambda e: self.indent_selected(),
             "<Control-Left>": lambda e: self.outdent_selected(),
+            # Both the shifted and unshifted key, and the numpad, so Ctrl+= works
+            # the way it does in a browser.
+            "<Control-plus>": lambda e: self.nudge_scale(scaling.STEP),
+            "<Control-equal>": lambda e: self.nudge_scale(scaling.STEP),
+            "<Control-KP_Add>": lambda e: self.nudge_scale(scaling.STEP),
+            "<Control-minus>": lambda e: self.nudge_scale(-scaling.STEP),
+            "<Control-KP_Subtract>": lambda e: self.nudge_scale(-scaling.STEP),
+            "<Control-0>": lambda e: self.set_scale(1.0),
         }
         # Bound on the main window rather than bind_all, so that these do not
         # fire while a modal dialog has focus.
@@ -820,6 +872,58 @@ class App:
             self.dirty = False
         except StoreError as error:
             messagebox.showerror("Save failed", str(error), parent=self.root)
+
+    # -- ui scale ----------------------------------------------------------
+
+    def set_scale(self, factor: float) -> None:
+        """Scale the whole window to ``factor`` and remember it."""
+        previous = self.scale.factor
+        applied = self.scale.apply(factor)
+        self.scale_var.set(applied)
+        if applied == previous:
+            return
+        self._rescale_widgets()
+        self._pending_scale = applied
+        self._save_scale_soon()
+
+    def nudge_scale(self, delta: float) -> None:
+        self.set_scale(self.scale.factor + delta)
+
+    def _apply_tree_metrics(self) -> None:
+        """The tree's pixel measurements, which no font change touches."""
+        self.style.configure("Treeview", rowheight=self.scale.row_height())
+        self.style.configure("Treeview.Item",
+                             indicatorsize=self.scale.px(self._base_indicator))
+        for column, width in BASE_COLUMNS.items():
+            self.tree.column(column, width=self.scale.px(width))
+
+    def _rescale_widgets(self) -> None:
+        """Resize what the font change does not cover: pixel measurements."""
+        self._apply_tree_metrics()
+        self.root.minsize(*self.scale.dims(*BASE_MINSIZE))
+
+        # Resize the window, or the larger text just gets less room. This is
+        # the default size at the new scale - the same rule __init__ uses -
+        # rather than the current size times a ratio: the window manager clamps
+        # what it cannot fit, and scaling off a clamped size compounds that
+        # error until Reset no longer returns to where it started.
+        if not self.root.winfo_viewable():
+            return
+        width, height = self.scale.dims(*BASE_WINDOW)
+        self.root.geometry("{}x{}".format(
+            min(width, self.root.winfo_screenwidth()),
+            min(height, self.root.winfo_screenheight()),
+        ))
+
+    def _save_scale_soon(self) -> None:
+        """Debounce the write: Ctrl+/- autorepeats, and each step would save."""
+        if getattr(self, "_scale_save_job", None) is not None:
+            self.root.after_cancel(self._scale_save_job)
+        self._scale_save_job = self.root.after(400, self._save_scale_now)
+
+    def _save_scale_now(self) -> None:
+        self._scale_save_job = None
+        self.prefs.set("ui_scale", self._pending_scale)
 
     # -- window / tray lifecycle -------------------------------------------
 

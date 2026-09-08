@@ -1,10 +1,22 @@
 """Notification-area (system tray) icon, in the style of Pageant.
 
 Right-click the icon for the whole session tree as nested submenus; click a
-session to launch it. Left-click (or double-click) opens the manager window.
+session to launch it. Left-click opens the manager window.
 
-The tray needs ``pystray`` and ``Pillow``. When they are missing the app still
-runs as a plain window - ``is_available()`` reports which.
+Two backends, chosen at run time by :func:`_pick_backend`:
+
+``sni``
+    Our own ``org.kde.StatusNotifierItem`` implementation (see :mod:`.sni`).
+    This is what modern Linux desktops actually speak, and it is preferred
+    there - pystray's XEmbed icon is blank and inert on Plasma. Needs Pillow
+    and jeepney.
+``pystray``
+    Used on Windows and macOS, and as the Linux fallback for the older XEmbed
+    trays that some lightweight desktops still run.
+
+Both render the same backend-neutral :mod:`.traymenu` tree, so the menu is
+built once here. When neither backend works the app still runs as a plain
+window - ``is_available()`` reports which.
 """
 
 from __future__ import annotations
@@ -17,7 +29,9 @@ import threading
 import traceback
 from typing import Callable
 
+from . import sni, traymenu
 from .model import Node
+from .traymenu import Item
 
 #: Set PUTTYDIR_DEBUG=1 to see why the icon or tray failed. A windowed build has
 #: no console, so these paths are otherwise completely silent - which is exactly
@@ -90,29 +104,47 @@ def can_draw_icon() -> bool:
     return PIL_ERROR is None
 
 
-def is_available() -> bool:
+def _pick_backend() -> str | None:
+    """Which tray backend to use, or None if there is no usable one.
+
+    Linux prefers SNI. On Plasma, and on GNOME with the AppIndicator extension,
+    StatusNotifierItem is the only protocol the panel really implements;
+    pystray's XEmbed icon there is blank and does nothing when clicked.
+    """
+    if PIL_ERROR is not None:
+        return None
+    if sys.platform.startswith("linux") and sni.is_available():
+        return "sni"
     _probe()
-    return pystray is not None
+    return "pystray" if pystray is not None else None
+
+
+def is_available() -> bool:
+    return _pick_backend() is not None
 
 
 def unavailable_reason() -> str:
+    if PIL_ERROR is not None:
+        return (f"{PIL_ERROR}\n\nInstall the tray dependencies:\n"
+                f"  pip install pillow")
     _probe()
     error = _TRAY_ERROR
+    if sys.platform.startswith("linux"):
+        # On Linux both backends have to have failed to get here, so report
+        # both reasons - the SNI one is usually the actionable half.
+        return (
+            f"No StatusNotifierItem tray: {sni.unavailable_reason()}\n\n"
+            f"No XEmbed fallback either: {error}\n\n"
+            "A tray needs a running graphical session with a D-Bus session bus:\n"
+            "  - start it from inside your desktop, not over SSH or a console\n"
+            "  - on GNOME, install the AppIndicator extension\n"
+            "  - autostarting via ~/.config/autostart gets this right for you"
+        )
     if error is None:
         return "The tray is available."
     if isinstance(error, ImportError):
         return (f"{error}\n\nInstall the tray dependencies:\n"
-                f"  pip install pystray pillow python-xlib")
-    if "display" in str(error).lower():
-        return (
-            f"{error}\n\n"
-            "No usable X display, so no tray icon. A tray needs a running\n"
-            "graphical session:\n"
-            "  - start it from inside your desktop, not over SSH or a console\n"
-            "  - on Wayland, XWayland must be present, or install PyGObject to\n"
-            "    use the AppIndicator backend instead of X11\n"
-            "  - autostarting via ~/.config/autostart gets this right for you"
-        )
+                f"  pip install pystray pillow")
     return str(error)
 
 
@@ -165,31 +197,64 @@ def icon_photo_data() -> str:
 
 
 class Tray:
-    """Owns the pystray icon and keeps its menu in step with the directory.
+    """Owns the tray icon and keeps its menu in step with the directory.
 
-    pystray runs its own event loop, so the icon lives on a background thread
-    and every callback is marshalled back onto the Tk thread by ``dispatch``.
+    Both backends run their own loop on a background thread, so every callback
+    arrives off the GUI thread and is marshalled back onto it by ``dispatch``.
     """
 
     def __init__(self, app, dispatch: Callable[[Callable[[], None]], None]):
         self.app = app
         self.dispatch = dispatch
-        self.icon = None
+        self.backend = None       # sni.StatusNotifierTray
+        self.icon = None          # pystray.Icon
+        self.kind: str | None = None
         self.error: BaseException | None = None
         self._thread: threading.Thread | None = None
 
     # -- lifecycle --------------------------------------------------------
 
     def start(self) -> bool:
-        if not is_available():
+        kind = _pick_backend()
+        if kind is None:
             debug(f"tray unavailable: {unavailable_reason()}")
             return False
+        if kind == "sni":
+            if self._start_sni():
+                return True
+            # No SNI host answered - a bare window manager, say. XEmbed may
+            # still work there, so it is worth trying before giving up.
+            debug("no StatusNotifierItem host answered; trying XEmbed")
+            _probe()
+            if pystray is not None and self._start_pystray():
+                return True
+            return False
+        return self._start_pystray()
+
+    def _start_sni(self) -> bool:
+        try:
+            backend = sni.StatusNotifierTray(
+                "puttydirectory", self._title(),
+                icon_factory=make_image,
+                menu_factory=self.build_items,
+            )
+            if not backend.start():
+                return False
+        except Exception as error:
+            debug("could not start the StatusNotifierItem tray", error)
+            self.error = error
+            return False
+        self.backend = backend
+        self.kind = "sni"
+        return True
+
+    def _start_pystray(self) -> bool:
         try:
             self.icon = pystray.Icon(
                 "puttydirectory",
                 icon=make_image(),
-                title="PuTTY Directory",
-                menu=self.build_menu(),
+                title=self._title(),
+                menu=self._pystray_menu(),
             )
         except Exception as error:
             # Drawing the image or building the menu can fail on its own - most
@@ -198,6 +263,7 @@ class Tray:
             self.error = error
             self.icon = None
             return False
+        self.kind = "pystray"
         self._thread = threading.Thread(target=self._run, daemon=True, name="tray")
         self._thread.start()
         return True
@@ -213,29 +279,42 @@ class Tray:
             self.icon = None
 
     def stop(self) -> None:
+        if self.backend is not None:
+            self.backend.stop()
+            self.backend = None
         if self.icon is not None:
             try:
                 self.icon.stop()
             except Exception:
                 pass
             self.icon = None
+        self.kind = None
+
+    def _title(self) -> str:
+        """The hover tooltip names the open file, so two directories are
+        tellable apart from the tray alone."""
+        store = getattr(self.app, "store", None)
+        return (f"PuTTY Directory - {store.path.name}" if store
+                else "PuTTY Directory - no directory open")
 
     def refresh(self) -> None:
         """Rebuild the menu after the directory changed."""
+        if self.backend is not None:
+            self.backend.refresh(title=self._title())
+            return
         if self.icon is None:
             return
         try:
-            self.icon.menu = self.build_menu()
+            self.icon.menu = self._pystray_menu()
             self.icon.update_menu()
-            # The hover tooltip names the open file, so you can tell two
-            # directories apart from the tray alone.
-            store = getattr(self.app, "store", None)
-            self.icon.title = (f"PuTTY Directory - {store.path.name}" if store
-                               else "PuTTY Directory - no directory open")
+            self.icon.title = self._title()
         except Exception:
             pass
 
     def notify(self, message: str, title: str = "PuTTY Directory") -> None:
+        if self.backend is not None:
+            self.backend.notify(message, title)
+            return
         if self.icon is None:
             return
         try:
@@ -243,70 +322,97 @@ class Tray:
         except Exception:
             pass  # Not every backend implements notifications.
 
-    # -- menu -------------------------------------------------------------
+    # -- menu (backend-neutral) -------------------------------------------
 
-    def build_menu(self):
-        items = []
+    def build_items(self) -> list[Item]:
+        """The whole menu as :mod:`.traymenu` items, newest state each call."""
+        items: list[Item] = []
 
         recent = self._recent_items()
         if recent:
-            items.append(pystray.MenuItem("Recent", pystray.Menu(*recent)))
-            items.append(pystray.Menu.SEPARATOR)
+            items.append(traymenu.submenu("Recent", recent))
+            items.append(traymenu.separator())
 
         if self.app.store is None:
-            items.append(pystray.MenuItem("(no directory open)", None, enabled=False))
+            items.append(traymenu.disabled("(no directory open)"))
         else:
             tree_items = self._items_for(self.app.directory.tree)
-            if tree_items:
-                items.extend(tree_items)
-            else:
-                items.append(pystray.MenuItem("(no sessions yet)", None, enabled=False))
-        items.append(pystray.Menu.SEPARATOR)
+            items.extend(tree_items or [traymenu.disabled("(no sessions yet)")])
+        items.append(traymenu.separator())
 
-        items.append(pystray.MenuItem("Open PuTTY Directory", self._on_open, default=True))
-        items.append(pystray.MenuItem("Add session...", self._on_add))
-        items.append(pystray.Menu.SEPARATOR)
-        items.append(pystray.MenuItem("Exit", self._on_exit))
-        return pystray.Menu(*items)
+        items.append(traymenu.command("Open PuTTY Directory", self._on_open, default=True))
+        items.append(traymenu.command("Add session...", self._on_add))
+        items.append(traymenu.separator())
+        items.append(traymenu.command("Exit", self._on_exit))
+        return items
 
-    def _items_for(self, nodes: list[Node]) -> list:
-        """Map the node tree onto pystray menu items, folders as submenus."""
-        items = []
+    def _items_for(self, nodes: list[Node]) -> list[Item]:
+        """Map the node tree onto menu items, folders as submenus."""
+        items: list[Item] = []
         for node in nodes:
             if node.is_folder:
                 children = self._items_for(node.children)
                 if not children:
-                    children = [pystray.MenuItem("(empty)", None, enabled=False)]
-                items.append(pystray.MenuItem(node.name, pystray.Menu(*children)))
+                    children = [traymenu.disabled("(empty)")]
+                items.append(traymenu.submenu(node.name, children))
             else:
-                items.append(
-                    pystray.MenuItem(node.name, self._connect_action(node.id))
-                )
+                items.append(traymenu.command(node.name, self._connect_action(node.id)))
         return items
 
-    def _recent_items(self) -> list:
-        items = []
+    def _recent_items(self) -> list[Item]:
+        items: list[Item] = []
         for node_id in self.app.directory.settings.get("recent", [])[:MAX_RECENT]:
             found = self.app.directory.locate(node_id)
             if found is None or found.node.is_folder:
                 continue
             path = "/".join(ancestor.name for ancestor in found.ancestors)
             label = f"{found.node.name}  ({path})" if path else found.node.name
-            items.append(pystray.MenuItem(label, self._connect_action(node_id)))
+            items.append(traymenu.command(label, self._connect_action(node_id)))
         return items
 
-    # -- callbacks (called on the tray thread) ----------------------------
+    # -- pystray rendering -------------------------------------------------
+
+    def _pystray_menu(self):
+        return pystray.Menu(*self._to_pystray(self.build_items()))
+
+    def _to_pystray(self, items: list[Item]) -> list:
+        out = []
+        for item in items:
+            if item.separator:
+                out.append(pystray.Menu.SEPARATOR)
+            elif item.is_submenu:
+                children = self._to_pystray(item.children or [])
+                if not children:
+                    children = [pystray.MenuItem("(empty)", None, enabled=False)]
+                out.append(pystray.MenuItem(item.label, pystray.Menu(*children)))
+            else:
+                out.append(pystray.MenuItem(
+                    item.label,
+                    self._wrap(item.action),
+                    enabled=item.enabled and item.action is not None,
+                    default=item.default,
+                ))
+        return out
+
+    @staticmethod
+    def _wrap(action):
+        """pystray hands callbacks (icon, item); our items take no arguments."""
+        if action is None:
+            return None
+        return lambda _icon=None, _item=None: action()
+
+    # -- callbacks (called on the backend's thread) ------------------------
 
     def _connect_action(self, node_id: str):
-        def action(_icon=None, _item=None):
+        def action():
             self.dispatch(lambda: self.app.connect_node(node_id))
         return action
 
-    def _on_open(self, _icon=None, _item=None):
+    def _on_open(self):
         self.dispatch(self.app.show_window)
 
-    def _on_add(self, _icon=None, _item=None):
+    def _on_add(self):
         self.dispatch(self.app.add_session_from_tray)
 
-    def _on_exit(self, _icon=None, _item=None):
+    def _on_exit(self):
         self.dispatch(self.app.quit_app)

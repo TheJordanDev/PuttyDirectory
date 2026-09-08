@@ -84,15 +84,17 @@ source "$VENV/bin/activate"
 
 note "installing dependencies"
 python -m pip install --quiet --upgrade pip
-python -m pip install --quiet pillow pystray python-xlib pyinstaller
+python -m pip install --quiet pillow pystray python-xlib jeepney pyinstaller
 
 # --- tray backend ------------------------------------------------------------
-# pystray needs one of: python-xlib (X11), or PyGObject + AppIndicator. Only the
-# first is pip-installable, so it is what we bundle. It talks X11, which works
-# natively on X sessions and through XWayland on Wayland ones.
+# The tray speaks StatusNotifierItem over D-Bus, which is what Plasma, and GNOME
+# with the AppIndicator extension, actually implement. That needs only jeepney.
+# python-xlib is kept for the XEmbed fallback used by older, lighter panels.
 
+python -c 'import jeepney' 2>/dev/null \
+    || warn "jeepney missing - no tray on Plasma/GNOME (see puttydirectory/sni.py)."
 python -c 'import Xlib' 2>/dev/null \
-    || warn "python-xlib missing - the build will have no tray icon."
+    || warn "python-xlib missing - no XEmbed fallback for older panels."
 
 note "building"
 python build.py "$@"

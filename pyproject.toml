@@ -7,8 +7,11 @@ requires-python = ">=3.11"
 dependencies = [
     "pillow>=12.3.0",
     "pystray>=0.19.5",
-    # pystray's X11 backend. Unlike the GTK/AppIndicator ones it needs no system
-    # packages and freezes cleanly, so it is the portable choice on Linux.
+    # The Linux tray speaks StatusNotifierItem over D-Bus (see
+    # puttydirectory/sni.py); jeepney is a pure-Python D-Bus client, so it needs
+    # no system packages and freezes cleanly.
+    "jeepney>=0.9.0; sys_platform == 'linux'",
+    # Only for the XEmbed fallback on desktops with no SNI host.
     "python-xlib>=0.33; sys_platform == 'linux'",
 ]
 

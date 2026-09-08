@@ -250,24 +250,42 @@ and replaced rather than half-used.
 
 ### The tray backend
 
-pystray needs one of three backends, and the choice matters when freezing:
+The Linux tray does **not** go through pystray. `puttydirectory/sni.py`
+implements `org.kde.StatusNotifierItem` (SNI) directly on
+[jeepney](https://pypi.org/project/jeepney/), a pure-Python D-Bus client.
 
-- **`_xorg`** — needs `python-xlib`, a pip package. Bundles cleanly, so this is
-  what the spec picks and what `pyproject.toml` installs on Linux. Talks X11,
-  which works on X sessions and through XWayland on Wayland ones.
-- **`_appindicator` / `_gtk`** — need PyGObject and system GTK libraries.
-  Painful to freeze and much larger. The spec includes them only if `gi` is
-  already importable.
+That is a deliberate replacement for pystray's Linux backends, none of which
+work here:
 
-The spec picks backends by probing for `Xlib` and `gi` rather than importing
-pystray, because importing pystray runs its own backend selection and raises
-when none is usable. Force one with `PYSTRAY_BACKEND=xorg` at build time.
+- **`_xorg`** — needs `python-xlib`, and bundles cleanly, which is why it was
+  the original choice. But it draws a legacy **XEmbed** icon, and modern
+  desktops do not implement XEmbed. KDE Plasma only sees it via
+  `xembedsniproxy`, which derives the icon by *screenshotting* the X window —
+  under Xwayland that window is never really composited, so the icon comes out
+  **blank** — and relays clicks as synthetic X events the backend ignores, so
+  clicking does **nothing**. A blank, inert icon is the exact symptom.
+- **`_appindicator` / `_gtk`** — these do speak SNI, but only through PyGObject
+  and its system typelibs. Not pip-installable, much larger, and unreliable
+  under PyInstaller.
 
-**GNOME shows no tray icons at all** without the AppIndicator extension, whatever
-backend you use — that is a GNOME policy, not a bug here. On GNOME install the
-extension plus `gir1.2-ayatanaappindicator3-0.1`; KDE, XFCE, Cinnamon and MATE
-all work out of the box. If no backend starts, the app falls back to a plain
-window rather than failing, and *Hide to tray* is greyed out.
+Talking SNI ourselves costs one pure-Python dependency, and it is the protocol
+Plasma and GNOME-with-AppIndicator actually implement. We serve two D-Bus
+objects: `/StatusNotifierItem` (artwork, tooltip, `Activate`) and `/MenuBar`
+(`com.canonical.dbusmenu`, the companion protocol hosts use to render the menu
+natively). `ItemIsMenu` is false so a left-click reaches `Activate` — which
+opens the window — while right-click gets the session menu.
+
+pystray is still a dependency: it drives the tray on Windows and macOS, and
+`tray.py` falls back to it on Linux if no SNI host answers, which covers the
+older, lighter panels that do still run an XEmbed tray. Both backends render the
+same backend-neutral menu tree from `puttydirectory/traymenu.py`.
+
+**GNOME shows no tray icons at all** without the AppIndicator extension — that
+is a GNOME policy, not a bug here. Install the extension (no
+`gir1.2-ayatanaappindicator3-0.1` needed any more, since we do not use
+PyGObject). KDE Plasma, XFCE, Cinnamon and MATE work out of the box. If no
+backend starts, the app falls back to a plain window rather than failing, and
+*Hide to tray* is greyed out.
 
 ### Icons and autostart
 

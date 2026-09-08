@@ -55,13 +55,27 @@ Autostarting through `~/.config/autostart` avoids this entirely, because the
 desktop session sets `DISPLAY` before launching anything in it. That is what
 `install-linux.sh --autostart` sets up.
 
-On Linux, pystray picks a backend at import: AppIndicator if `gi` and
-`AyatanaAppIndicator3` are present, otherwise GTK or plain XOrg. GNOME shows no
-tray at all without the AppIndicator extension, so on stock GNOME install
-`gir1.2-ayatanaappindicator3-0.1` and the extension, or force a backend with
-`PYSTRAY_BACKEND=xorg`. If none of that works the app falls back to window-only
-rather than failing. For autostart, a `.desktop` file in `~/.config/autostart`
-running `python main.py --tray` is the equivalent of the Windows shortcut.
+On Linux the tray speaks **StatusNotifierItem** over D-Bus, which is the
+protocol modern desktops actually implement — KDE Plasma (X11 and Wayland),
+XFCE, Cinnamon and MATE all work out of the box, and it needs no system
+packages beyond a session bus. GNOME shows no tray at all without the
+AppIndicator extension; that is GNOME policy, so install the extension. Older
+or lighter panels that still run an XEmbed tray are covered by a pystray
+fallback. If nothing works the app falls back to window-only rather than
+failing.
+
+`./install-linux.sh` puts the app in your application menu; add `--autostart`
+and it also starts hidden in the tray at login. Running from the menu opens the
+window, and there is a *Start hidden in the tray* action on the same entry
+(right-click it in the launcher).
+
+## Window size
+
+Tk does not read the desktop's scaling, so on a HiDPI screen — or just a big one
+— the window can come out smaller than everything around it. **View** sets a
+scale from 80% to 300%: presets from 100% to 200%, `Ctrl++` / `Ctrl+-` to step
+by 10%, and `Ctrl+0` back to 100%. It applies immediately, resizes the window to
+suit, and is remembered in `preferences.json` as `ui_scale`.
 
 ## Working with several directories
 
@@ -190,6 +204,7 @@ each empty field.
 | Edit / duplicate / delete | `F2` / `Ctrl+D` / `Del` |
 | Connect | `Enter`, or double-click |
 | Filter | `Ctrl+F` |
+| Bigger / smaller UI | `Ctrl++` / `Ctrl+-`, `Ctrl+0` to reset |
 | Hide to tray | the window's X button |
 
 New items are created inside the selected folder, or next to the selected

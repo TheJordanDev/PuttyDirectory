@@ -55,14 +55,18 @@ install -m 644 dist/puttydirectory.png "$ICON"
 note "icon    -> $ICON"
 
 # Rewrite Exec to the installed location rather than reusing the build path.
-sed "s|^Exec=.*|Exec=$TARGET --tray|" dist/puttydirectory.desktop > "$DESKTOP"
+# The app-menu entry launches with the window up; only the autostart copy gets
+# --tray, so logging in does not throw a window in your face. The substitution
+# keeps each line's own arguments, so the [Desktop Action Tray] entry stays.
+sed -E "s|^Exec=[^ ]+( .*)?$|Exec=$TARGET\1|" dist/puttydirectory.desktop > "$DESKTOP"
 chmod 644 "$DESKTOP"
 note "desktop -> $DESKTOP"
 
 if [ "${1:-}" = "--autostart" ]; then
     mkdir -p "$AUTOSTART_DIR"
-    cp "$DESKTOP" "$AUTOSTART"
-    note "autostart -> $AUTOSTART"
+    sed "s|^Exec=$TARGET$|Exec=$TARGET --tray|" "$DESKTOP" > "$AUTOSTART"
+    chmod 644 "$AUTOSTART"
+    note "autostart -> $AUTOSTART (hidden, tray only)"
 fi
 
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$APP_DIR" 2>/dev/null || true
