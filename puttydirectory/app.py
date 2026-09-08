@@ -6,30 +6,37 @@ import os
 import sys
 import tkinter as tk
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 from . import launcher, tray as tray_module
 from .dialogs import NodeDialog, SettingsDialog
 from .model import FOLDER, SESSION, Directory, Node, resolve, walk
+from .preferences import Preferences
 from .store import Store, StoreError
 
 DRAG_THRESHOLD = 6  # pixels before a click counts as a drag
 
 
 class App:
-    def __init__(self, root: tk.Tk, store: Store, directory: Directory,
-                 start_hidden: bool = False):
+    def __init__(self, root: tk.Tk, store: Store | None, directory: Directory,
+                 start_hidden: bool = False, prefs: Preferences | None = None):
         self.root = root
         self.store = store
         self.directory = directory
+        self.prefs = prefs or Preferences.load()
         self.dirty = False
+        # Older directory files carried app-level settings; take them over once
+        # so upgrading does not lose the configured PuTTY path.
+        self.prefs.adopt_legacy(directory.settings)
+        if store is not None:
+            self.prefs.remember_file(store.path)
         self.tray: tray_module.Tray | None = None
 
         self._drag_id: str | None = None
         self._drag_origin: tuple[int, int] | None = None
         self._dragging = False
 
-        root.title(f"PuTTY Directory - {store.path.name}")
+        root.title("PuTTY Directory")
         root.geometry("760x520")
         root.minsize(520, 320)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -42,6 +49,7 @@ class App:
         self._bind_keys()
 
         self._start_tray()
+        self._sync_file_state()
         self.refresh()
 
         if start_hidden and self.tray is not None:
@@ -73,10 +81,18 @@ class App:
         menu = tk.Menu(self.root)
 
         file_menu = tk.Menu(menu, tearoff=0)
-        file_menu.add_command(label=str(self.store.path), state="disabled")
+        file_menu.add_command(label="New directory...", accelerator="Ctrl+Shift+O",
+                              command=self.new_file)
+        file_menu.add_command(label="Open...", accelerator="Ctrl+O", command=self.open_file_dialog)
+
+        self.recent_menu = tk.Menu(file_menu, tearoff=0)
+        file_menu.add_cascade(label="Open recent", menu=self.recent_menu)
+
+        file_menu.add_command(label="Close", accelerator="Ctrl+W", command=self.close_file)
         file_menu.add_separator()
-        file_menu.add_command(label="Save", accelerator="Ctrl+S", command=self.save)
-        file_menu.add_command(label="Open config folder", command=self.open_config_folder)
+        file_menu.add_command(label="Save", accelerator="Ctrl+S", command=self.save_now)
+        file_menu.add_command(label="Save as...", accelerator="Ctrl+Shift+S", command=self.save_as)
+        file_menu.add_command(label="Reveal in file manager", command=self.open_config_folder)
         file_menu.add_separator()
         file_menu.add_command(label="Settings...", command=self.edit_settings)
         file_menu.add_separator()
@@ -110,12 +126,19 @@ class App:
         bar = ttk.Frame(self.root, padding=(6, 6))
         bar.pack(fill="x")
 
-        ttk.Button(bar, text="Connect", command=self.connect_selected).pack(side="left")
+        connect = ttk.Button(bar, text="Connect", command=self.connect_selected)
+        connect.pack(side="left")
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=6)
-        ttk.Button(bar, text="+ Session", command=self.add_session).pack(side="left")
-        ttk.Button(bar, text="+ Folder", command=self.add_folder).pack(side="left", padx=(4, 0))
-        ttk.Button(bar, text="Edit", command=self.edit_selected).pack(side="left", padx=(4, 0))
-        ttk.Button(bar, text="Delete", command=self.delete_selected).pack(side="left", padx=(4, 0))
+        add_session = ttk.Button(bar, text="+ Session", command=self.add_session)
+        add_session.pack(side="left")
+        add_folder = ttk.Button(bar, text="+ Folder", command=self.add_folder)
+        add_folder.pack(side="left", padx=(4, 0))
+        edit = ttk.Button(bar, text="Edit", command=self.edit_selected)
+        edit.pack(side="left", padx=(4, 0))
+        delete = ttk.Button(bar, text="Delete", command=self.delete_selected)
+        delete.pack(side="left", padx=(4, 0))
+        # Everything here needs a directory open; _sync_file_state greys them out.
+        self.file_buttons = [connect, add_session, add_folder, edit, delete]
 
         ttk.Label(bar, text="Filter:").pack(side="left", padx=(12, 4))
         self.filter_var = tk.StringVar()
@@ -182,9 +205,13 @@ class App:
 
     def _bind_keys(self) -> None:
         binds = {
+            "<Control-o>": lambda e: self.open_file_dialog(),
+            "<Control-O>": lambda e: self.new_file(),
+            "<Control-w>": lambda e: self.close_file(),
+            "<Control-S>": lambda e: self.save_as(),
             "<Control-n>": lambda e: self.add_session(),
             "<Control-N>": lambda e: self.add_folder(),
-            "<Control-s>": lambda e: self.save(),
+            "<Control-s>": lambda e: self.save_now(),
             "<Control-d>": lambda e: self.duplicate_selected(),
             "<Control-f>": lambda e: self.filter_entry.focus_set(),
             "<F2>": lambda e: self.edit_selected(),
@@ -217,11 +244,14 @@ class App:
             self.tree.focus(previous)
             self.tree.see(previous)
 
-        nodes = list(self.directory.all_nodes())
-        sessions = sum(1 for node in nodes if not node.is_folder)
-        folders = len(nodes) - sessions
-        self.status.set(f"{sessions} sessions, {folders} folders")
-        putty = launcher.find_putty(self.directory.settings.get("putty_path", ""))
+        if not self.has_file():
+            self.status.set("No directory open  -  File > Open, or File > New directory")
+        else:
+            nodes = list(self.directory.all_nodes())
+            sessions = sum(1 for node in nodes if not node.is_folder)
+            folders = len(nodes) - sessions
+            self.status.set(f"{sessions} sessions, {folders} folders")
+        putty = launcher.find_putty(self.prefs.get("putty_path", ""))
         state = f"putty: {Path(putty).name}" if putty else "putty: NOT FOUND"
         self.putty_status.set(state if self.tray is None else f"{state}  |  tray active")
 
@@ -294,6 +324,8 @@ class App:
         self._add_node(FOLDER)
 
     def _add_node(self, node_type: str) -> None:
+        if not self._require_file():
+            return
         siblings, ancestors = self.directory.container_for(self.selected_id())
         node = Node(type=node_type)
         inherited = self._inherited_values(ancestors)
@@ -333,7 +365,7 @@ class App:
         node = self.selected_node()
         if node is None:
             return
-        if self.directory.settings.get("confirm_delete", True):
+        if self.prefs.get("confirm_delete", True):
             detail = ""
             if node.is_folder and node.children:
                 inner = sum(1 for _ in walk(node)) - 1
@@ -461,7 +493,7 @@ class App:
             messagebox.showinfo("Connect", "Select a session, not a folder.", parent=self.root)
             return None
 
-        putty = launcher.find_putty(self.directory.settings.get("putty_path", ""))
+        putty = launcher.find_putty(self.prefs.get("putty_path", ""))
         if not putty:
             messagebox.showerror(
                 "PuTTY not found",
@@ -527,16 +559,183 @@ class App:
 
     # -- settings and persistence -----------------------------------------
 
+    # -- open / close / save-as -------------------------------------------
+
+    def has_file(self) -> bool:
+        return self.store is not None
+
+    def _load_into(self, path: Path) -> bool:
+        """Point the window at a directory file. False if it could not be read."""
+        store = Store(path)
+        try:
+            directory = store.load()
+        except StoreError as error:
+            messagebox.showerror("Open", str(error), parent=self.root)
+            self.prefs.forget_file(path)
+            self._rebuild_recent_menu()
+            return False
+
+        self.prefs.adopt_legacy(directory.settings)
+        self.store = store
+        self.directory = directory
+        self.dirty = False
+        self.filter_var.set("")
+        self.prefs.remember_file(path)
+        self._sync_file_state()
+        self.refresh(keep_selection=False)
+        return True
+
+    def _sync_file_state(self) -> None:
+        """Update everything that depends on which file is open."""
+        name = self.store.path.name if self.store else "no file open"
+        self.root.title(f"PuTTY Directory - {name}")
+        self._rebuild_recent_menu()
+
+        state = "normal" if self.has_file() else "disabled"
+        for label in ("Close", "Save", "Save as...", "Reveal in file manager"):
+            self.file_menu.entryconfigure(label, state=state)
+        for button in self.file_buttons:
+            button.configure(state=state)
+
+    def _rebuild_recent_menu(self) -> None:
+        self.recent_menu.delete(0, "end")
+        current = str(self.store.path.resolve()) if self.store else None
+        entries = [item for item in self.prefs.recent_files if item != current]
+        if not entries:
+            self.recent_menu.add_command(label="(nothing yet)", state="disabled")
+            return
+        for item in entries:
+            path = Path(item)
+            # Show the parent folder too: several files are likely to be called
+            # something like directory.json.
+            label = f"{path.name}   -   {path.parent}"
+            self.recent_menu.add_command(
+                label=label, command=lambda p=path: self.open_path(p)
+            )
+        self.recent_menu.add_separator()
+        self.recent_menu.add_command(label="Clear list", command=self._clear_recent)
+
+    def _clear_recent(self) -> None:
+        self.prefs.clear_recent_files()
+        self._rebuild_recent_menu()
+
+    def open_path(self, path: Path) -> None:
+        if self.store and Path(path).resolve() == self.store.path.resolve():
+            return
+        if not Path(path).exists():
+            if messagebox.askyesno(
+                "Open",
+                f"{path}\n\nThis file no longer exists. Remove it from the recent list?",
+                parent=self.root,
+            ):
+                self.prefs.forget_file(path)
+                self._rebuild_recent_menu()
+            return
+        if self.dirty:
+            self.save()
+        self._load_into(Path(path))
+
+    def open_file_dialog(self) -> None:
+        start = self.store.path.parent if self.store else Path.home()
+        chosen = filedialog.askopenfilename(
+            parent=self.root,
+            title="Open session directory",
+            initialdir=str(start),
+            filetypes=[("Session directory", "*.json"), ("All files", "*.*")],
+        )
+        if chosen:
+            self.open_path(Path(chosen))
+
+    def new_file(self) -> None:
+        """Create an empty directory file and switch to it."""
+        chosen = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="New session directory",
+            defaultextension=".json",
+            initialfile="sessions.json",
+            filetypes=[("Session directory", "*.json"), ("All files", "*.*")],
+        )
+        if not chosen:
+            return
+        if self.dirty:
+            self.save()
+        try:
+            Store(Path(chosen)).create_empty()
+        except StoreError as error:
+            messagebox.showerror("New directory", str(error), parent=self.root)
+            return
+        self._load_into(Path(chosen))
+
+    def save_as(self) -> None:
+        """Write the open directory to a new file and continue editing there."""
+        if not self.has_file():
+            return
+        chosen = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Save session directory as",
+            defaultextension=".json",
+            initialfile=self.store.path.name,
+            initialdir=str(self.store.path.parent),
+            filetypes=[("Session directory", "*.json"), ("All files", "*.*")],
+        )
+        if not chosen:
+            return
+        store = Store(Path(chosen))
+        try:
+            store.save(self.directory)
+        except StoreError as error:
+            messagebox.showerror("Save as", str(error), parent=self.root)
+            return
+        self.store = store
+        self.dirty = False
+        self.prefs.remember_file(store.path)
+        self._sync_file_state()
+        self.refresh()
+        self.status.set(f"Saved as {store.path.name}")
+
+    def close_file(self) -> None:
+        if not self.has_file():
+            return
+        if self.dirty:
+            self.save()
+        self.store = None
+        self.directory = Directory()
+        self.dirty = False
+        self.filter_var.set("")
+        self._sync_file_state()
+        self.refresh(keep_selection=False)
+
+    def save_now(self) -> None:
+        """The Save menu item. Changes are written as you make them, so this
+        only matters for the expand/collapse state and as reassurance."""
+        if not self.has_file():
+            return
+        self.save()
+        self.status.set(f"Saved {self.store.path.name}")
+
+    def _require_file(self) -> bool:
+        if self.has_file():
+            return True
+        messagebox.showinfo(
+            "No directory open",
+            "Open a session directory first, or create one with "
+            "File > New directory.",
+            parent=self.root,
+        )
+        return False
+
     def edit_settings(self) -> None:
-        detected = launcher.find_putty(self.directory.settings.get("putty_path", ""))
-        updated = SettingsDialog(self.root, dict(self.directory.settings), detected).show()
+        detected = launcher.find_putty(self.prefs.get("putty_path", ""))
+        updated = SettingsDialog(self.root, dict(self.prefs.data), detected).show()
         if updated is None:
             return
-        self.directory.settings = updated
-        self.save()
+        self.prefs.data = updated
+        self.prefs.save()
         self.refresh()
 
     def open_config_folder(self) -> None:
+        if not self.has_file():
+            return
         folder = self.store.path.parent
         folder.mkdir(parents=True, exist_ok=True)
         try:
@@ -553,6 +752,8 @@ class App:
             messagebox.showerror("Open folder", str(error), parent=self.root)
 
     def save(self) -> None:
+        if self.store is None:
+            return  # Nothing open; edits are blocked anyway.
         try:
             self.store.save(self.directory)
             self.dirty = False
@@ -574,9 +775,8 @@ class App:
         if self.dirty:
             self.save()
         self.root.withdraw()
-        if not self.directory.settings.get("tray_hint_shown"):
-            self.directory.settings["tray_hint_shown"] = True
-            self.save()
+        if not self.prefs.get("tray_hint_shown"):
+            self.prefs.set("tray_hint_shown", True)
             self.tray.notify(
                 "Still running here. Right-click for your sessions."
             )
@@ -588,7 +788,7 @@ class App:
 
     def on_close(self) -> None:
         """The window's X button: hide to the tray if there is one."""
-        if self.tray is not None and self.directory.settings.get("close_to_tray", True):
+        if self.tray is not None and self.prefs.get("close_to_tray", True):
             self.hide_window()
             return
         self.quit_app()
@@ -624,25 +824,32 @@ def _new_root() -> tk.Tk | None:
 
 
 def run(config_path: Path, start_hidden: bool = False) -> int:
-    store = Store(config_path)
     root = _new_root()
     if root is None:
         return 1
 
+    prefs = Preferences.load()
+    store = Store(config_path)
     try:
         directory = store.load()
     except StoreError as error:
+        # A broken or unreadable file should not stop the app from starting -
+        # open with nothing loaded so File > Open still works.
         root.withdraw()
-        messagebox.showerror("PuTTY Directory", str(error))
-        root.destroy()
-        return 1
+        messagebox.showerror("PuTTY Directory", f"{error}\n\nStarting with no directory open.")
+        root.deiconify()
+        prefs.forget_file(config_path)
+        store, directory = None, Directory()
+
+    if store is not None:
+        prefs.remember_file(store.path)
 
     try:
         ttk.Style().theme_use("vista" if root.tk.call("tk", "windowingsystem") == "win32" else "clam")
     except tk.TclError:
         pass
 
-    app = App(root, store, directory, start_hidden=start_hidden)
+    app = App(root, store, directory, start_hidden=start_hidden, prefs=prefs)
     if start_hidden and app.tray is None:
         messagebox.showwarning(
             "Tray unavailable",

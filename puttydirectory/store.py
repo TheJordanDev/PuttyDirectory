@@ -41,6 +41,13 @@ def resolve_config_path(explicit: str | None = None) -> Path:
     # Keep using a config.json sitting next to the app if one is already there.
     if LEGACY_FILE.exists():
         return LEGACY_FILE.resolve()
+    # Otherwise reopen whatever was open last, so the app comes back where you
+    # left it. Imported lazily: preferences imports this module.
+    from .preferences import Preferences
+
+    last = Preferences.load().last_file
+    if last and last.exists():
+        return last
     return default_config_path()
 
 
@@ -70,6 +77,13 @@ class Store:
         except OSError as error:
             temp.unlink(missing_ok=True)
             raise StoreError(f"Could not write {self.path}:\n{error}") from error
+
+
+    def create_empty(self) -> Directory:
+        """Start a new, empty directory file at this path."""
+        directory = Directory()
+        self.save(directory)
+        return directory
 
 
 class StoreError(Exception):

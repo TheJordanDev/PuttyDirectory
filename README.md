@@ -63,6 +63,34 @@ tray at all without the AppIndicator extension, so on stock GNOME install
 rather than failing. For autostart, a `.desktop` file in `~/.config/autostart`
 running `python main.py --tray` is the equivalent of the Windows shortcut.
 
+## Working with several directories
+
+Sessions live in ordinary JSON files, and the File menu treats them as
+documents:
+
+| Action | Shortcut |
+| --- | --- |
+| New directory... | `Ctrl+Shift+O` |
+| Open... | `Ctrl+O` |
+| Open recent | - |
+| Close | `Ctrl+W` |
+| Save | `Ctrl+S` |
+| Save as... | `Ctrl+Shift+S` |
+
+So a work set and a personal set are just two files you switch between, rather
+than two shortcuts with different `--config` flags. **Open recent** remembers the
+last ten, showing each file's folder alongside its name because they are all
+likely to be called something like `sessions.json`. A file that has since been
+deleted offers to drop itself from the list.
+
+The window title and the tray tooltip both name the open file, so two running
+copies are tellable apart. With nothing open the tree is empty and the editing
+buttons grey out; **Save as** copies the open directory to a new file and keeps
+editing there.
+
+Edits are still written to disk as you make them - **Save** is only there for
+reassurance and to flush the expand/collapse state.
+
 ## Where the sessions are stored
 
 The first of these that applies wins:
@@ -70,14 +98,26 @@ The first of these that applies wins:
 1. `--config PATH`
 2. the `PUTTYDIR_CONFIG` environment variable
 3. `config.json` in the current directory, if one exists
-4. the per-user default:
+4. the file you had open last
+5. the per-user default:
    - Windows: `%APPDATA%\PuttyDirectory\directory.json`
    - Linux: `~/.config/PuttyDirectory/directory.json`
    - macOS: `~/Library/Application Support/PuttyDirectory/directory.json`
 
-Keeping work and personal sets apart is just two shortcuts pointing at two
-files. The file is plain JSON and diffs cleanly, so it is safe to keep a work
-directory in a private git repo.
+The file is plain JSON and diffs cleanly, so it is safe to keep a work directory
+in a private git repo.
+
+### App settings vs directory contents
+
+App-level settings - the PuTTY path, the confirm-on-delete and close-to-tray
+toggles, and the recent-files list - live in `preferences.json` next to the
+default directory file, **not** inside whichever directory is open. They used to
+live in the directory file, which meant opening a second one silently changed
+your PuTTY path. Old files are migrated the first time they are opened, so
+nothing is lost.
+
+What stays in the directory file is what belongs to it: the tree, and which of
+its own sessions you connected to most recently.
 
 An older flat `{"entries": [...]}` file is migrated to the tree format the first
 time it is loaded.

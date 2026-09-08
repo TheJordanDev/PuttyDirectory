@@ -227,6 +227,11 @@ class Tray:
         try:
             self.icon.menu = self.build_menu()
             self.icon.update_menu()
+            # The hover tooltip names the open file, so you can tell two
+            # directories apart from the tray alone.
+            store = getattr(self.app, "store", None)
+            self.icon.title = (f"PuTTY Directory - {store.path.name}" if store
+                               else "PuTTY Directory - no directory open")
         except Exception:
             pass
 
@@ -248,11 +253,14 @@ class Tray:
             items.append(pystray.MenuItem("Recent", pystray.Menu(*recent)))
             items.append(pystray.Menu.SEPARATOR)
 
-        tree_items = self._items_for(self.app.directory.tree)
-        if tree_items:
-            items.extend(tree_items)
+        if self.app.store is None:
+            items.append(pystray.MenuItem("(no directory open)", None, enabled=False))
         else:
-            items.append(pystray.MenuItem("(no sessions yet)", None, enabled=False))
+            tree_items = self._items_for(self.app.directory.tree)
+            if tree_items:
+                items.extend(tree_items)
+            else:
+                items.append(pystray.MenuItem("(no sessions yet)", None, enabled=False))
         items.append(pystray.Menu.SEPARATOR)
 
         items.append(pystray.MenuItem("Open PuTTY Directory", self._on_open, default=True))
