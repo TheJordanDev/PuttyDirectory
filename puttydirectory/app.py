@@ -55,8 +55,9 @@ class App:
         try:
             self._icon_image = tk.PhotoImage(data=tray_module.icon_photo_data())
             self.root.iconphoto(True, self._icon_image)
-        except Exception:
-            pass
+        except Exception as error:
+            tray_module.debug("could not set the window icon", error)
+            tray_module._diagnose_pillow()
 
     def _start_tray(self) -> None:
         if tray_module.is_available():

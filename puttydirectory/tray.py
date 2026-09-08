@@ -11,10 +11,39 @@ from __future__ import annotations
 
 import base64
 import io
+import os
+import sys
 import threading
+import traceback
 from typing import Callable
 
 from .model import Node
+
+#: Set PUTTYDIR_DEBUG=1 to see why the icon or tray failed. A windowed build has
+#: no console, so these paths are otherwise completely silent - which is exactly
+#: what makes "no tray icon" so hard to diagnose.
+DEBUG = bool(os.environ.get("PUTTYDIR_DEBUG"))
+
+if os.environ.get("PUTTYDIR_DEBUG") == "verbose":
+    # Pillow logs plugin-registration failures at debug level and otherwise
+    # swallows them, which is what hid the missing PNG/ICO codecs. Very noisy -
+    # it also logs every plugin it loads - so it is opt-in beyond plain DEBUG.
+    import logging
+
+    logging.basicConfig(level=logging.DEBUG, stream=sys.stderr,
+                        format="[%(name)s] %(message)s")
+
+
+def debug(message: str, error: BaseException | None = None) -> None:
+    """Report a swallowed failure, when there is anywhere to report it to."""
+    if not DEBUG or sys.stderr is None:
+        return
+    try:
+        print(f"[puttydirectory] {message}", file=sys.stderr, flush=True)
+        if error is not None:
+            traceback.print_exception(type(error), error, error.__traceback__, file=sys.stderr)
+    except Exception:
+        pass
 
 try:  # Pillow only draws the image; it never touches the display.
     from PIL import Image, ImageDraw
@@ -87,6 +116,26 @@ def unavailable_reason() -> str:
     return str(error)
 
 
+def _diagnose_pillow() -> None:
+    """Report why Pillow cannot save, when PUTTYDIR_DEBUG is set."""
+    if not DEBUG or PIL_ERROR is not None:
+        return
+    debug(f"PIL.__file__      = {getattr(Image, '__file__', '?')}")
+    debug(f"PIL._plugins      = {len(getattr(__import__('PIL'), '_plugins', []))} entries")
+    for name in ("PngImagePlugin", "IcoImagePlugin", "BmpImagePlugin"):
+        try:
+            __import__(f"PIL.{name}")
+            debug(f"import PIL.{name}: ok")
+        except Exception as error:
+            debug(f"import PIL.{name}: FAILED", error)
+    try:
+        Image.init()
+        debug(f"Image.SAVE keys   = {sorted(Image.SAVE)}")
+        debug(f"Image._initialized= {Image._initialized}")
+    except Exception as error:
+        debug("Image.init() raised", error)
+
+
 def make_image(size: int = 64):
     """Draw the icon: a dark terminal tile with a green prompt."""
     image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
@@ -126,19 +175,29 @@ class Tray:
         self.app = app
         self.dispatch = dispatch
         self.icon = None
+        self.error: BaseException | None = None
         self._thread: threading.Thread | None = None
 
     # -- lifecycle --------------------------------------------------------
 
     def start(self) -> bool:
         if not is_available():
+            debug(f"tray unavailable: {unavailable_reason()}")
             return False
-        self.icon = pystray.Icon(
-            "puttydirectory",
-            icon=make_image(),
-            title="PuTTY Directory",
-            menu=self.build_menu(),
-        )
+        try:
+            self.icon = pystray.Icon(
+                "puttydirectory",
+                icon=make_image(),
+                title="PuTTY Directory",
+                menu=self.build_menu(),
+            )
+        except Exception as error:
+            # Drawing the image or building the menu can fail on its own - most
+            # often a Pillow codec missing from a frozen build.
+            debug("could not create the tray icon", error)
+            self.error = error
+            self.icon = None
+            return False
         self._thread = threading.Thread(target=self._run, daemon=True, name="tray")
         self._thread.start()
         return True
@@ -146,9 +205,11 @@ class Tray:
     def _run(self) -> None:  # pragma: no cover - needs a real tray
         try:
             self.icon.run()
-        except Exception:
+        except Exception as error:
             # A missing or broken tray (no AppIndicator, no X session) must not
             # take the app down with it; the window still works.
+            debug("the tray icon stopped", error)
+            self.error = error
             self.icon = None
 
     def stop(self) -> None:

@@ -98,9 +98,11 @@ EXCLUDES = [
     "multiprocessing",
     "asyncio",
     "concurrent",
-    "decimal",
-    "_decimal",
-    "_pydecimal",
+    # NOT decimal/_decimal/_pydecimal: PIL.PngImagePlugin imports fractions,
+    # and fractions imports decimal. Excluding it kills PNG *and* ICO saving
+    # (IcoImagePlugin imports PngImagePlugin), which silently costs you the tray
+    # icon and the window icon - pystray builds its HICON by saving an ICO.
+    # Worth 0.45 MB to keep. Run --selftest after changing anything here.
     "statistics",
     "curses",
     "readline",

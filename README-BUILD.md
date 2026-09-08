@@ -1,10 +1,53 @@
 # Building a standalone executable
 
 ```sh
-python build.py             # dist/PuttyDirectory.exe          9.0 MB
+build-windows.bat           # Windows, from cmd or a double-click
+./build-windows.sh          # Windows, from Git Bash
+./build-linux.sh            # Linux
+python build.py             # any platform, if the environment is already set up
+```
+
+All four end at the same `build.py`. The wrappers only add environment setup:
+find a usable Python, check tkinter, create and validate a venv, install the
+build dependencies. Each takes `--onedir` and `--clean`.
+
+```sh
+python build.py             # dist/PuttyDirectory.exe          9.1 MB
 python build.py --onedir    # dist/PuttyDirectory/            19.9 MB, starts faster
 python build.py --clean     # throw away cached analysis first
 ```
+
+## uv venvs have no pip
+
+This project is uv-managed, and **uv does not install pip into the venv it
+creates**. So the obvious health check - "can I run pip in there?" - reports a
+perfectly good `.venv` as broken. All three wrappers therefore prefer
+`uv sync --dev` whenever `uv` and `uv.lock` are both present, and fall back to
+`venv` + pip only when uv is unavailable. That also pins exact versions, which a
+loose `pip install` would not.
+
+None of the scripts delete an environment automatically any more. An earlier
+version did, on exactly that bad pip check, and destroyed a working `.venv`
+(recoverable only because `uv.lock` could rebuild it). A wrong guess costs real
+work, so they now report the problem and the command to fix it, and stop.
+
+## Two things that bite batch files
+
+`build-windows.bat` needs **CRLF line endings**. With LF endings cmd mangles
+labels and `goto`, and the script dies with no output at all - not an error, just
+silence. `.gitattributes` pins `*.bat` to `eol=crlf` so git cannot reintroduce
+this.
+
+It also resolves a real `python.exe` via `sys.executable` before doing anything
+else, rather than calling `py`/`python` directly. On a machine with pyenv-win
+those are **`.bat` shims**, and calling a batch file from a batch file without
+`CALL` transfers control and never returns - the script stops dead, silently,
+part way through. Same failure signature, different cause.
+
+For the same family of reasons the double-click pause uses cmd string
+substitution instead of piping to `find`: with Git on PATH, `find` is Git's Unix
+`find`, which rejects `/i`. Set `PUTTYDIR_NOPAUSE=1` to suppress the pause when
+scripting the build.
 
 `build.py` renders `assets/icon.ico` from the same code that draws the tray
 icon, writes the Windows version resource, then runs PyInstaller against
@@ -44,6 +87,23 @@ zoneinfo for Tcl's `clock` command, which no Tkinter widget reaches.
 
 **`optimize=2`** strips docstrings and asserts from the bundled bytecode.
 
+### Two excludes that do not work
+
+**`decimal` cost the tray icon.** It looks obviously unused, but the chain is
+`PIL.PngImagePlugin` -> `fractions` -> `decimal`. Excluding it makes
+`PngImagePlugin` fail to import, so PNG saving disappears; `IcoImagePlugin`
+imports `PngImagePlugin`, so ICO saving goes with it. pystray builds its tray
+HICON by saving the image as an ICO, so **the tray icon silently vanishes** -
+and so does the window icon, which is drawn from a PNG.
+
+Nothing reports this. Pillow swallows plugin-import failures into
+`logger.debug`, pystray swallows the resulting error inside its own thread, and
+a windowed build has no console to print to anyway. The app looks like it works.
+Keeping `decimal` costs 0.45 MB uncompressed, ~0.1 MB in the final exe.
+
+The same mechanism, harmlessly: excluding `PIL._imagingmath` breaks
+`GifImagePlugin`. We never save GIFs, so it stays excluded.
+
 ### One exclude that does not work
 
 `urllib` looks unused, but `pathlib` imports `urllib.parse` for `Path.as_uri()`.
@@ -82,12 +142,31 @@ tracebacks.
 
 ## Verifying a build
 
-The GUI is windowed, so a broken bundle fails silently. These check it for real:
+**`build.py` runs `--selftest` on the binary it just built and fails the build
+if it does not pass.** That is not belt-and-braces: an over-aggressive exclude
+produces a bundle that starts happily with broken icons, and PyInstaller reports
+success. Verified by re-adding the `decimal` exclude - the build exits 1 with:
+
+```text
+  FAIL  save PNG (window icon): KeyError: 'PNG'
+  FAIL  save ICO (tray icon): KeyError: 'ICO'
+```
+
+Run it by hand any time:
 
 ```sh
+dist/PuttyDirectory.exe --selftest   # icon + codec + tray pipeline
 dist/PuttyDirectory.exe --list       # exercises imports, model, config loading
 dist/PuttyDirectory.exe --version
 ```
+
+The tray check is skipped, not failed, on a headless Linux host - the codec
+checks are the ones that catch a bad build, and they need no display.
+
+Set `PUTTYDIR_DEBUG=1` to make the icon and tray paths report why they failed
+instead of staying silent, or `PUTTYDIR_DEBUG=verbose` to also turn on Pillow's
+own plugin-loading log. Capture it with `Start-Process -RedirectStandardError`;
+a plain `>` redirect does not capture a windowed build's output.
 
 Those work because the app calls `AttachConsole(ATTACH_PARENT_PROCESS)` when it
 is started with arguments — a windowed build has no console of its own, so

@@ -54,8 +54,69 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="launch a session by its 'Folder/Name' path and exit")
     parser.add_argument("--tray", action="store_true",
                         help="start minimised to the notification area")
+    parser.add_argument("--selftest", action="store_true",
+                        help="verify the icon and tray pipeline, then exit")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser.parse_args(argv)
+
+
+def command_selftest() -> int:
+    """Check the things a frozen build breaks silently.
+
+    Trimming modules to shrink the executable is easy to get wrong: PyInstaller
+    reports a successful build, the app starts, and only the icons quietly stop
+    working. Pillow swallows plugin-import failures, and pystray swallows the
+    resulting icon failure, so nothing surfaces. This exercises those paths for
+    real and fails loudly, so `--selftest` after a build catches it.
+    """
+    import io
+
+    failures = 0
+
+    def check(label: str, action) -> None:
+        nonlocal failures
+        try:
+            action()
+        except Exception as error:
+            failures += 1
+            print(f"  FAIL  {label}: {type(error).__name__}: {error}")
+        else:
+            print(f"  ok    {label}")
+
+    print(f"PuTTY Directory {__version__} self-test")
+    print(f"  frozen: {bool(getattr(sys, 'frozen', False))}")
+
+    from . import tray
+
+    check("Pillow available", lambda: _assert(tray.can_draw_icon(), "Pillow did not import"))
+    check("draw the icon", lambda: tray.make_image(64))
+    # PNG backs the window icon; ICO is what pystray converts into the tray
+    # HICON. Both need PIL.PngImagePlugin, which needs fractions -> decimal.
+    check("save PNG (window icon)", lambda: tray.make_image(16).save(io.BytesIO(), format="PNG"))
+    check("save ICO (tray icon)", lambda: tray.make_image(16).save(io.BytesIO(), format="ICO"))
+    check("tkinter importable", lambda: __import__("tkinter"))
+
+    # The tray backend is the one check that needs a display, so on a headless
+    # Linux box (a CI runner, a build over SSH) it is skipped rather than
+    # failed. The codec checks above are what actually catch a bad build.
+    import os
+
+    headless = sys.platform != "win32" and not os.environ.get("DISPLAY")
+    if headless and not tray.is_available():
+        print("  skip  pystray backend: no DISPLAY (headless build host)")
+    else:
+        check("pystray backend", lambda: _assert(tray.is_available(), tray.unavailable_reason()))
+
+    if failures:
+        print(f"\n{failures} check(s) failed - the build is broken.", file=sys.stderr)
+        return 1
+    print("\nAll checks passed.")
+    return 0
+
+
+def _assert(condition: bool, message: str) -> None:
+    if not condition:
+        raise RuntimeError(message)
 
 
 def iter_paths(nodes: list[Node], ancestors: list[Node] | None = None):
@@ -118,6 +179,9 @@ def main(argv: list[str] | None = None) -> int:
         attach_console()
     args = parse_args(argv)
     path = resolve_config_path(args.config)
+
+    if args.selftest:
+        return command_selftest()
 
     if args.list or args.connect:
         try:

@@ -55,9 +55,14 @@ venv_usable() {
     [ -x "$VENV/bin/python" ] && "$VENV/bin/python" -m pip --version >/dev/null 2>&1
 }
 
+# Never delete an existing environment automatically. A uv-managed venv has no
+# pip in it by design, so this check can call a perfectly good environment
+# broken - and a wrong guess here destroys real work. Report and stop instead.
 if [ -d "$VENV" ] && ! venv_usable; then
-    warn "$VENV exists but has no working pip; recreating it"
-    rm -rf "$VENV"
+    fail "$VENV exists but has no working pip.
+If uv created it, build with uv instead:  uv sync --dev && python build.py
+Otherwise remove it and re-run:
+    rm -rf $VENV"
 fi
 
 if [ ! -d "$VENV" ]; then

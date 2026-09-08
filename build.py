@@ -153,7 +153,25 @@ def main() -> int:
     if sys.platform.startswith("linux"):
         print(f"desktop -> {write_desktop_entry(binary)}")
         report_glibc()
-    return 0
+
+    return run_selftest(binary)
+
+
+def run_selftest(binary: Path) -> int:
+    """Run the built binary's own checks.
+
+    A trimmed build can start fine and still have broken icons - PyInstaller
+    reports success either way. Making the build fail here is the only thing
+    that reliably catches an over-aggressive exclude.
+    """
+    print("\nverifying the build:")
+    result = subprocess.run([str(binary), "--selftest"], capture_output=True, text=True)
+    print((result.stdout or "").rstrip())
+    if result.returncode != 0:
+        print((result.stderr or "").rstrip(), file=sys.stderr)
+        print("\nThe binary built but does not work. Check the excludes in "
+              "PuttyDirectory.spec.", file=sys.stderr)
+    return result.returncode
 
 
 def report_glibc() -> None:
