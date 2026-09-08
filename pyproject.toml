@@ -1,0 +1,24 @@
+[project]
+name = "puttydirectory"
+version = "0.2.0"
+description = "A hierarchical session manager that launches PuTTY"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pillow>=12.3.0",
+    "pystray>=0.19.5",
+    # pystray's X11 backend. Unlike the GTK/AppIndicator ones it needs no system
+    # packages and freezes cleanly, so it is the portable choice on Linux.
+    "python-xlib>=0.33; sys_platform == 'linux'",
+]
+
+[project.scripts]
+puttydirectory = "puttydirectory.cli:main"
+
+[tool.setuptools]
+packages = ["puttydirectory"]
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.22.2",
+]

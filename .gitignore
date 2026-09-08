@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.venv-linux
+
+# Session data - may contain passwords in plain text
+config.json
+directory.json
+*.directory.json
+
+# Build output
+build/
+dist/
+assets/
+*.manifest
