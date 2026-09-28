@@ -128,9 +128,11 @@ class App:
         menu.add_cascade(label="File", menu=file_menu)
         self.file_menu = file_menu
 
-        edit_menu = tk.Menu(menu, tearoff=0)
+        edit_menu = tk.Menu(menu, tearoff=0, postcommand=self._label_edit_entries)
         edit_menu.add_command(label="New session", accelerator="Ctrl+N", command=self.add_session)
+        self._edit_new_session_index = edit_menu.index("end")
         edit_menu.add_command(label="New folder", accelerator="Ctrl+Shift+N", command=self.add_folder)
+        self._edit_new_folder_index = edit_menu.index("end")
         edit_menu.add_command(label="Import from PuTTY...", command=self.import_from_putty)
         edit_menu.add_separator()
         edit_menu.add_command(label="Edit", accelerator="F2", command=self.edit_selected)
@@ -142,6 +144,7 @@ class App:
         edit_menu.add_command(label="Move into folder above", accelerator="Ctrl+Right", command=self.indent_selected)
         edit_menu.add_command(label="Move out of folder", accelerator="Ctrl+Left", command=self.outdent_selected)
         menu.add_cascade(label="Edit", menu=edit_menu)
+        self.edit_menu = edit_menu
 
         session_menu = tk.Menu(menu, tearoff=0)
         session_menu.add_command(label="Connect", accelerator="Enter", command=self.connect_selected)
@@ -236,8 +239,12 @@ class App:
         self.menu.add_command(label="Duplicate", command=self.duplicate_selected)
         self.menu.add_command(label="Delete", command=self.delete_selected)
         self.menu.add_separator()
-        self.menu.add_command(label="New session here", command=self.add_session)
-        self.menu.add_command(label="New folder here", command=self.add_folder)
+        # Indices are kept because _label_create_entries rewrites these labels
+        # to name the destination, so they cannot be addressed by label.
+        self.menu.add_command(label="New session", command=self.add_session)
+        self._new_session_index = self.menu.index("end")
+        self.menu.add_command(label="New folder", command=self.add_folder)
+        self._new_folder_index = self.menu.index("end")
         self.menu.add_separator()
         self.menu.add_command(label="Show command line", command=self.show_command)
 
@@ -274,15 +281,58 @@ class App:
             "<Control-KP_Subtract>": lambda e: self.nudge_scale(-scaling.STEP),
             "<Control-0>": lambda e: self.set_scale(1.0),
         }
+        # These are also text-editing keys: Tk's Entry class binds Control-d to
+        # "delete character", and Control-Left/Right are <<PrevWord>>/<<NextWord>>.
+        # The class binding runs before this one, so without a guard typing
+        # Ctrl+D in the filter box would delete a character *and* duplicate the
+        # selected node. While a text field has focus they belong to the text.
+        text_keys = {"<Control-d>", "<Control-Left>", "<Control-Right>",
+                     "<Control-Up>", "<Control-Down>"}
+
         # Bound on the main window rather than bind_all, so that these do not
         # fire while a modal dialog has focus.
         for sequence, handler in binds.items():
-            self.root.bind(sequence, lambda e, h=handler: (h(e), "break")[1])
+            guard = sequence in text_keys
+            self.root.bind(sequence, lambda e, h=handler, g=guard:
+                           None if (g and self._typing()) else (h(e), "break")[1])
 
         # Delete and Return only apply while the tree has focus, so they do not
         # interfere with typing in the filter box.
         self.tree.bind("<Delete>", lambda e: self.delete_selected())
         self.tree.bind("<Return>", lambda e: self.connect_selected())
+        # The keyboard route back to "nothing selected"; clicking empty space is
+        # the other. Needed because a new node is created inside the selected
+        # folder, so without it the top level becomes unreachable.
+        self.tree.bind("<Escape>", lambda e: self.clear_selection())
+
+        self._fix_x11_text_keys()
+
+    def _fix_x11_text_keys(self) -> None:
+        """Give Ctrl+A its Windows meaning in text fields on Linux.
+
+        Tk maps the <<SelectAll>> virtual event per windowing system: on win32
+        it is Control-slash *and* Control-a, but on x11 it is Control-slash
+        alone (tk.tcl). Nothing else binds Control-a there, so in every entry
+        box - the filter, and every field in the dialogs - Ctrl+A simply does
+        nothing on Linux while it selects all on Windows.
+
+        Adding it to the virtual event rather than binding the widgets means
+        ttk.Entry, tk.Entry and tk.Text all pick it up through the class
+        bindings they already have, including widgets built later by dialogs.
+        """
+        if self.root.tk.call("tk", "windowingsystem") != "x11":
+            return
+        try:
+            self.root.event_add("<<SelectAll>>", "<Control-Key-a>")
+        except tk.TclError:
+            pass  # Already mapped; nothing to do.
+
+    def _typing(self) -> bool:
+        """Is focus in a text field, where editing keys outrank accelerators?"""
+        widget = self.root.focus_get()
+        if widget is None:
+            return False
+        return widget.winfo_class() in ("Entry", "TEntry", "Text", "TCombobox")
 
     # -- tree rendering ---------------------------------------------------
 
@@ -521,6 +571,21 @@ class App:
         self._drag_id = self.tree.identify_row(event.y)
         self._drag_origin = (event.x, event.y)
         self._dragging = False
+        # Clicking past the last row clears the selection. Without this there is
+        # no way back to "nothing selected", and since a new node is created
+        # inside the selected folder, selecting one folder would leave no way to
+        # create anything at the top level again.
+        if not self._drag_id:
+            self.clear_selection()
+
+    def clear_selection(self) -> None:
+        """Deselect everything, so the next new node goes to the top level."""
+        selection = self.tree.selection()
+        if selection:
+            self.tree.selection_remove(*selection)
+        # The focus ring is separate from the selection and would otherwise stay
+        # drawn on the row that was just deselected.
+        self.tree.focus("")
 
     def _on_motion(self, event: tk.Event) -> None:
         if not self._drag_id or self._drag_origin is None or self.filter_var.get().strip():
@@ -587,13 +652,50 @@ class App:
         if item_id:
             self.tree.selection_set(item_id)
             self.tree.focus(item_id)
+        else:
+            # Right-clicking empty space targets the top level, and says so.
+            self.clear_selection()
         node = self.directory.get(item_id) if item_id else None
         state = "normal" if node is not None and not node.is_folder else "disabled"
         self.menu.entryconfigure("Connect", state=state)
         self.menu.entryconfigure("Show command line", state=state)
         for label in ("Edit", "Duplicate", "Delete"):
             self.menu.entryconfigure(label, state="normal" if node is not None else "disabled")
+        self._label_create_entries()
         self.menu.tk_popup(event.x_root, event.y_root)
+
+    def _create_target(self) -> str:
+        """Where a new node would go, phrased for a menu label."""
+        node = self.selected_node()
+        if node is None:
+            return "at top level"
+        if node.is_folder:
+            return f"in {node.name}"
+        # A session is selected, so the new node lands beside it.
+        found = self.directory.locate(node.id)
+        parent = found.ancestors[-1] if found and found.ancestors else None
+        return f"in {parent.name}" if parent else "at top level"
+
+    def _label_create_entries(self) -> None:
+        """Retitle the create entries to name their destination.
+
+        Where a new node lands depends on the selection, which is easy to get
+        wrong silently - especially since selecting a folder is sticky. Saying
+        it on the menu entry makes it checkable before clicking.
+        """
+        target = self._create_target()
+        for index, kind in ((self._new_session_index, "session"),
+                            (self._new_folder_index, "folder")):
+            self.menu.entryconfigure(index, label=f"New {kind} {target}")
+
+    def _label_edit_entries(self) -> None:
+        """Same for the Edit menu, refreshed each time it is opened."""
+        if not self.has_file():
+            return
+        target = self._create_target()
+        for index, kind in ((self._edit_new_session_index, "session"),
+                            (self._edit_new_folder_index, "folder")):
+            self.edit_menu.entryconfigure(index, label=f"New {kind} {target}")
 
     # -- connecting -------------------------------------------------------
 
