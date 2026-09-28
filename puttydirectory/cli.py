@@ -58,6 +58,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="verify the icon and tray pipeline, then exit")
     parser.add_argument("--tray-dump", action="store_true",
                         help="report the tray backend and the menu it would serve")
+    parser.add_argument("--ui-dump", action="store_true",
+                        help="report Tk's keyboard wiring for this build")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser.parse_args(argv)
 
@@ -185,6 +187,68 @@ def command_tray_dump(config_path) -> int:
     return 0
 
 
+def command_ui_dump() -> int:
+    """Report how Tk wires the keyboard here, and whether our fix took.
+
+    Tk binds Ctrl+A differently per windowing system *and* per release: some
+    builds fold it into <<LineStart>>, where it moves the caret instead of
+    selecting. That cannot be reproduced from another machine, so this prints
+    the actual tables rather than what the docs say they should be.
+
+    Its mere presence also answers "is this build current?" - an older binary
+    rejects --ui-dump outright.
+    """
+    import tkinter as tk
+
+    from .app import App
+
+    root = tk.Tk()
+    root.withdraw()
+
+    print(f"PuTTY Directory {__version__} UI diagnostics")
+    print(f"  tk version          : {root.tk.call('info', 'patchlevel')}")
+    print(f"  windowingsystem     : {root.tk.call('tk', 'windowingsystem')}")
+
+    print("\n  virtual events Ctrl+A could belong to:")
+    for name in ("<<SelectAll>>", "<<LineStart>>", "<<PrevChar>>", "<<SelectNone>>"):
+        mapped = root.tk.call("event", "info", name)
+        hit = "  <-- Ctrl+A is here" if "Control-Key-a" in str(mapped) else ""
+        print(f"    {name:<16}: {mapped}{hit}")
+
+    print("\n  class bindings for Ctrl+A, before our fix:")
+    for klass in ("TEntry", "Entry", "Text", "TCombobox"):
+        existing = root.bind_class(klass, "<Control-Key-a>")
+        print(f"    {klass:<12}: {existing or '(none)'}")
+
+    App._fix_text_field_keys(_Stub(root))
+
+    print("\n  after our fix:")
+    for klass in ("TEntry", "Entry", "Text", "TCombobox"):
+        existing = root.bind_class(klass, "<Control-Key-a>")
+        state = "bound" if existing else "STILL UNBOUND - fix did not apply"
+        print(f"    {klass:<12}: {state}")
+
+    print("\n  If Ctrl+A still moves the caret with all four bound, the binding")
+    print("  is being overridden per-widget; send this output.")
+    root.destroy()
+    return 0
+
+
+class _Stub:
+    """Just enough of App to run the real _fix_text_field_keys.
+
+    Calling App's own method rather than repeating the binding here is the
+    point: the dump then reports what the app actually does, not a copy of it
+    that could drift.
+    """
+
+    def __init__(self, root):
+        from .app import App
+
+        self.root = root
+        self._select_all_text = App._select_all_text
+
+
 def _sample_menu(path) -> list:
     """The real menu tree for the given directory, without needing a GUI."""
     try:
@@ -285,6 +349,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.tray_dump:
         return command_tray_dump(path)
+
+    if args.ui_dump:
+        return command_ui_dump()
 
     if args.list or args.connect:
         try:
