@@ -235,10 +235,18 @@ def command_ui_dump() -> int:
 
 
 class _Stub:
-    """Just enough of App for _fix_text_field_keys, which only needs root."""
+    """Just enough of App to run the real _fix_text_field_keys.
+
+    Calling App's own method rather than repeating the binding here is the
+    point: the dump then reports what the app actually does, not a copy of it
+    that could drift.
+    """
 
     def __init__(self, root):
+        from .app import App
+
         self.root = root
+        self._select_all_text = App._select_all_text
 
 
 def _sample_menu(path) -> list:
