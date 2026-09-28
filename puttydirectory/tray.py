@@ -216,6 +216,9 @@ class Tray:
 
     def start(self) -> bool:
         kind = _pick_backend()
+        debug(f"starting tray: backend={kind or 'none'} "
+              f"desktop={os.environ.get('XDG_CURRENT_DESKTOP', '?')} "
+              f"session={os.environ.get('XDG_SESSION_TYPE', '?')}")
         if kind is None:
             debug(f"tray unavailable: {unavailable_reason()}")
             return False
@@ -308,6 +311,7 @@ class Tray:
 
     def refresh(self) -> None:
         """Rebuild the menu after the directory changed."""
+        debug(f"Tray.refresh() via {self.kind or 'no backend'}")
         if self.backend is not None:
             self.backend.refresh(title=self._title())
             return
@@ -317,8 +321,8 @@ class Tray:
             self.icon.menu = self._pystray_menu()
             self.icon.update_menu()
             self.icon.title = self._title()
-        except Exception:
-            pass
+        except Exception as error:
+            debug("could not update the pystray menu", error)
 
     def notify(self, message: str, title: str = "PuTTY Directory") -> None:
         if self.backend is not None:
