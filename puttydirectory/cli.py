@@ -56,6 +56,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="start minimised to the notification area")
     parser.add_argument("--selftest", action="store_true",
                         help="verify the icon and tray pipeline, then exit")
+    parser.add_argument("--tray-dump", action="store_true",
+                        help="report the tray backend and the menu it would serve")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser.parse_args(argv)
 
@@ -112,6 +114,104 @@ def command_selftest() -> int:
         return 1
     print("\nAll checks passed.")
     return 0
+
+
+def command_tray_dump(config_path) -> int:
+    """Report what the tray would do here, and the exact menu it would serve.
+
+    The tray depends on things that cannot be reproduced from another machine:
+    which desktop is running, whether a StatusNotifierItem host answers, which
+    pystray backend got picked. This prints all of it plus the D-Bus menu tree,
+    so a "the menu does not work" report can be diagnosed from the output
+    instead of guessed at.
+    """
+    import os
+
+    from . import sni, tray
+
+    print(f"PuTTY Directory {__version__} tray diagnostics")
+    print(f"  platform            : {sys.platform}")
+    for name in ("XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE", "DISPLAY",
+                 "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS"):
+        value = os.environ.get(name)
+        print(f"  {name:<20}: {value if value else '(unset)'}")
+
+    print()
+    print(f"  Pillow available    : {tray.can_draw_icon()}")
+    print(f"  SNI available       : {sni.is_available()}")
+    if not sni.is_available():
+        print(f"     why not          : {sni.unavailable_reason().splitlines()[0]}")
+
+    tray._probe()
+    if tray.pystray is None:
+        print(f"  pystray             : unavailable")
+    else:
+        backend = getattr(tray.pystray.Icon, "__module__", "?")
+        has_menu = getattr(tray.pystray.Icon, "HAS_MENU", True)
+        print(f"  pystray backend     : {backend}")
+        print(f"  ...supports menus   : {has_menu}"
+              + ("" if has_menu else "   <-- this backend has NO menu at all"))
+
+    chosen = tray._pick_backend()
+    print(f"  backend that wins   : {chosen or 'none - window only'}")
+
+    # The menu tree, rendered the way the D-Bus host would receive it.
+    print()
+    print("  menu the tray would serve:")
+    items = _sample_menu(config_path)
+    model = sni._MenuModel()
+    model.rebuild(items)
+
+    def show(ident: int, depth: int) -> None:
+        for child in model.children.get(ident, []):
+            item = model.items[child]
+            label = "----" if item.separator else item.label
+            marks = []
+            if item.is_submenu:
+                marks.append("submenu")
+            if item.default:
+                marks.append("default")
+            if not item.enabled:
+                marks.append("disabled")
+            suffix = f"  [{', '.join(marks)}]" if marks else ""
+            print(f"    {'    ' * depth}id={child:<4} {label}{suffix}")
+            show(child, depth + 1)
+
+    show(0, 0)
+    print()
+    print(f"  dbusmenu revision   : {model.revision}")
+    print("  If submenus are missing in your panel but listed above, the menu is")
+    print("  being built correctly and the problem is on the host/protocol side.")
+    return 0
+
+
+def _sample_menu(path) -> list:
+    """The real menu tree for the given directory, without needing a GUI."""
+    try:
+        directory = Store(path).load()
+    except StoreError:
+        directory = None
+
+    from . import traymenu
+
+    if directory is None:
+        return [traymenu.disabled("(no directory open)")]
+
+    def build(nodes):
+        out = []
+        for node in nodes:
+            if node.is_folder:
+                children = build(node.children) or [traymenu.disabled("(empty)")]
+                out.append(traymenu.submenu(node.name, children))
+            else:
+                out.append(traymenu.command(node.name, lambda: None))
+        return out
+
+    items = build(directory.tree) or [traymenu.disabled("(no sessions yet)")]
+    items.append(traymenu.separator())
+    items.append(traymenu.command("Open PuTTY Directory", lambda: None, default=True))
+    items.append(traymenu.command("Exit", lambda: None))
+    return items
 
 
 def _assert(condition: bool, message: str) -> None:
@@ -182,6 +282,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.selftest:
         return command_selftest()
+
+    if args.tray_dump:
+        return command_tray_dump(path)
 
     if args.list or args.connect:
         try:

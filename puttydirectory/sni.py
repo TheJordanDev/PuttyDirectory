@@ -32,10 +32,44 @@ We serve two objects on our own bus name:
 from __future__ import annotations
 
 import os
+import sys
 import threading
+import time
 from typing import Callable, Optional
 
 from .traymenu import Item
+
+#: Set PUTTYDIR_DEBUG=1 to trace the D-Bus conversation. Everything in this
+#: module happens on a background thread against a host we cannot see, and the
+#: failure mode is silence, so a trace is the only way to tell "the host never
+#: asked" apart from "we answered wrongly".
+DEBUG = bool(os.environ.get("PUTTYDIR_DEBUG"))
+_started = time.monotonic()
+
+
+def _debug(message: str, error: BaseException | None = None) -> None:
+    if not DEBUG or sys.stderr is None:
+        return
+    try:
+        print(f"[sni {time.monotonic() - _started:7.2f}s] {message}",
+              file=sys.stderr, flush=True)
+        if error is not None:
+            import traceback
+
+            traceback.print_exception(type(error), error, error.__traceback__,
+                                      file=sys.stderr)
+    except Exception:
+        pass
+
+
+def _summarise(body) -> str:
+    """Render call arguments short enough to read on one log line."""
+    parts = []
+    for value in body or ():
+        text = repr(value)
+        parts.append(text if len(text) <= 60 else f"{text[:57]}...")
+    return "(" + ", ".join(parts) + ")"
+
 
 try:  # pragma: no cover - depends on what is installed
     from jeepney import (DBusAddress, MessageType, new_error, new_method_call,
@@ -106,24 +140,44 @@ class _MenuModel:
         self.children: dict[int, list[int]] = {0: []}
         self.revision = 1
         self._signature = None
+        # Ids must stay the same across rebuilds. A host holds onto the id of
+        # the submenu it is opening, and AboutToShow triggers a rebuild - so
+        # renumbering from a counter each time can hand back a layout in which
+        # that id now means something else, and the submenu opens empty or
+        # wrong. Keying by position in the tree keeps unchanged items stable.
+        self._ids: dict[tuple, int] = {}
+        self._next_id = 1
+
+    def _id_for(self, key: tuple) -> int:
+        ident = self._ids.get(key)
+        if ident is None:
+            ident = self._next_id
+            self._next_id += 1
+            self._ids[key] = ident
+        return ident
 
     def rebuild(self, roots: list[Item]) -> bool:
         """Load a new tree. Returns whether it differs from the last one."""
         items: dict[int, Item] = {}
         children: dict[int, list[int]] = {0: []}
-        counter = [0]
 
-        def walk(nodes: list[Item], parent: int) -> None:
+        def walk(nodes: list[Item], parent: int, path: tuple) -> None:
+            # Disambiguate siblings that share a label, so two sessions of the
+            # same name in different folders still get distinct keys.
+            seen: dict[str, int] = {}
             for node in nodes:
-                counter[0] += 1
-                ident = counter[0]
+                label = "|sep|" if node.separator else node.label
+                occurrence = seen.get(label, 0)
+                seen[label] = occurrence + 1
+                key = path + ((label, occurrence),)
+                ident = self._id_for(key)
                 items[ident] = node
                 children[parent].append(ident)
                 children[ident] = []
                 if node.is_submenu:
-                    walk(node.children or [], ident)
+                    walk(node.children or [], ident, key)
 
-        walk(roots, 0)
+        walk(roots, 0, ())
 
         # Compare by shape and labels: the callables differ on every rebuild
         # (they are freshly made closures), so they cannot be part of the key.
@@ -193,6 +247,15 @@ class StatusNotifierTray:
         self._menu = _MenuModel()
         self._pixmaps: list[tuple[int, int, bytes]] = []
         self._default_action: Optional[Callable[[], None]] = None
+        #: Revision the host last received for each menu id, from GetLayout.
+        #: AboutToShow compares against this to answer "is your copy of *this*
+        #: item stale", which is the question the host is actually asking.
+        #:
+        #: Per id, not one number for the whole menu: GetLayout is called per
+        #: item, so opening any submenu would otherwise mark the root as
+        #: up to date while the host still held the old root - after which the
+        #: root could never be reported stale again.
+        self._served: dict[int, int] = {}
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -205,12 +268,17 @@ class StatusNotifierTray:
                 self._close()
                 return False
 
+            _debug(f"claimed bus name {self._bus_name}")
             self._render()
             self._watch_for_host_restart()
             if not self._register():
+                _debug(f"{WATCHER_NAME} refused RegisterStatusNotifierItem")
                 self._close()
                 return False
-        except Exception:
+            _debug(f"registered with {WATCHER_NAME}; menu has "
+                   f"{len(self._menu.items)} items at revision {self._menu.revision}")
+        except Exception as error:
+            _debug("could not start the SNI tray", error)
             self._close()
             return False
 
@@ -310,6 +378,7 @@ class StatusNotifierTray:
     def refresh(self, title: str | None = None) -> None:
         """Rebuild the menu and tell the host to re-read it."""
         if self._conn is None:
+            _debug("refresh() ignored: no D-Bus connection")
             return
         try:
             if title and title != self.title:
@@ -318,11 +387,19 @@ class StatusNotifierTray:
                 self._emit(ITEM_PATH, SNI_IFACE, "NewToolTip", None, ())
             roots = self.menu_factory()
             self._default_action = self._find_default(roots)
-            if self._menu.rebuild(roots):
+            changed = self._menu.rebuild(roots)
+            # Announce whenever the host is behind, not only when *this* rebuild
+            # changed something. A rebuild triggered from AboutToShow consumes
+            # the change flag, and a signal the host missed leaves it behind
+            # with nothing further to tell it.
+            behind = self._served.get(0, 0) != self._menu.revision
+            _debug(f"refresh(): changed={changed} revision={self._menu.revision} "
+                   f"served(root)={self._served.get(0, 0)} items={len(self._menu.items)}")
+            if behind:
                 self._emit(MENU_PATH, MENU_IFACE, "LayoutUpdated", "ui",
                            (self._menu.revision, 0))
-        except Exception:
-            pass
+        except Exception as error:
+            _debug("refresh() failed", error)
 
     def notify(self, message: str, title: str) -> None:
         """Desktop notification via the standard freedesktop service."""
@@ -349,8 +426,10 @@ class StatusNotifierTray:
                 message = self._conn.receive(timeout=0.5)
             except TimeoutError:
                 continue
-            except Exception:
-                break  # Bus went away; the window keeps working without us.
+            except Exception as error:
+                # Bus went away; the window keeps working without us.
+                _debug("D-Bus receive failed, stopping the tray thread", error)
+                break
             if message.header.message_type is MessageType.signal:
                 self._handle_signal(message)
                 continue
@@ -358,7 +437,8 @@ class StatusNotifierTray:
                 continue
             try:
                 self._handle(message)
-            except Exception:
+            except Exception as error:
+                _debug(f"handler raised for {message.header.fields.get(3)}", error)
                 try:
                     self._reply(new_error(message, "org.freedesktop.DBus.Error.Failed"))
                 except Exception:
@@ -387,6 +467,7 @@ class StatusNotifierTray:
                             member, signature, body)
         with self._send_lock:
             self._conn.send(signal)
+        _debug(f"-> signal {interface.rsplit('.', 1)[-1]}.{member}{_summarise(body)}")
 
     def _handle(self, message) -> None:
         fields = message.header.fields
@@ -394,6 +475,9 @@ class StatusNotifierTray:
         interface = fields.get(2)  # HeaderFields.interface
         member = fields.get(3)     # HeaderFields.member
         body = message.body
+
+        if DEBUG and interface != MENU_IFACE:
+            _debug(f"<- {interface}.{member} on {path}")
 
         if interface == INTROSPECT_IFACE and member == "Introspect":
             self._reply(new_method_return(message, "s", (_introspection(path),)))
@@ -411,6 +495,8 @@ class StatusNotifierTray:
             self._handle_menu(message, member, body)
             return
 
+        _debug(f"!! no handler for {interface}.{member} on {path} - "
+               f"replying UnknownMethod")
         self._reply(new_error(message, "org.freedesktop.DBus.Error.UnknownMethod"))
 
     # -- org.freedesktop.DBus.Properties -----------------------------------
@@ -479,10 +565,17 @@ class StatusNotifierTray:
 
     def _handle_menu(self, message, member, body) -> None:
         menu = self._menu
+        if DEBUG:
+            sender = message.header.fields.get(7, "?")  # HeaderFields.sender
+            _debug(f"<- dbusmenu.{member}{_summarise(body)} from {sender}")
         if member == "GetLayout":
             parent, depth, _names = body
             layout = menu.layout(parent, depth)
             self._reply(new_method_return(message, "u(ia{sv}av)", (menu.revision, layout)))
+            # Remember what the host now holds, so AboutToShow can tell whether
+            # it has fallen behind. Everything GetLayout just returned is served,
+            # so mark the whole subtree it reached, not only its root.
+            self._mark_served(parent, depth, menu.revision)
 
         elif member == "GetGroupProperties":
             ids, _names = body
@@ -510,16 +603,49 @@ class StatusNotifierTray:
 
         elif member == "AboutToShow":
             # The host is about to draw the menu - resync it with the directory
-            # so a session added in the window shows up without a restart.
-            changed = self._resync()
-            self._reply(new_method_return(message, "b", (changed,)))
+            # so a folder added in the window shows up without a restart.
+            ident = body[0] if body else 0
+            stale = self._is_stale(ident)
+            self._reply(new_method_return(message, "b", (stale,)))
 
         elif member == "AboutToShowGroup":
-            changed = self._resync()
-            self._reply(new_method_return(message, "aiai", ([], [0] if changed else [])))
+            ids = body[0] if body else []
+            self._resync()
+            needs = [i for i in (ids or [0]) if self._is_stale(i, resync=False)]
+            self._reply(new_method_return(message, "aiai", ([], needs)))
 
         else:
             self._reply(new_error(message, "org.freedesktop.DBus.Error.UnknownMethod"))
+
+    def _mark_served(self, ident: int, depth: int, revision: int) -> None:
+        """Record that the host now holds `revision` of this item and, for as
+        far as GetLayout recursed, of its descendants."""
+        self._served[ident] = revision
+        if depth == 0:
+            return
+        for child in self._menu.children.get(ident, []):
+            self._mark_served(child, depth - 1, revision)
+
+    def _is_stale(self, ident: int = 0, resync: bool = True) -> bool:
+        """Has the host's copy of this item fallen behind ours?
+
+        Not the same question as "did this rebuild change anything". A change
+        made in the window rebuilds the menu straight away, so by the time the
+        host asks, that rebuild reports no further change - and answering with
+        it tells the host its cached layout is still good when it is not. The
+        window's own change would then only appear after some *later* edit
+        happened to land between two menu openings.
+
+        Comparing against the revision last handed out in GetLayout asks the
+        right question, and survives a LayoutUpdated signal the host ignored
+        or never subscribed to.
+        """
+        if resync:
+            self._resync()
+        stale = self._served.get(ident, 0) != self._menu.revision
+        _debug(f"    stale? id={ident} served={self._served.get(ident, 0)} "
+               f"current={self._menu.revision} -> {stale}")
+        return stale
 
     def _resync(self) -> bool:
         try:
@@ -548,18 +674,45 @@ def _introspection(path: str) -> str:
     <signal name="NewStatus"><arg type="s"/></signal>
   </interface>"""
     else:
+        # Declare everything actually implemented. libdbusmenu reads submenu
+        # item properties with GetGroupProperties and checks the Version
+        # property; a host that introspects first and does not see them can
+        # fall back to older behaviour, which is exactly where nested menus
+        # stop working. An incomplete interface here is a real defect even
+        # when a given host happens not to look.
         body = f"""
   <interface name="{MENU_IFACE}">
+    <property name="Version" type="u" access="read"/>
+    <property name="Status" type="s" access="read"/>
+    <property name="TextDirection" type="s" access="read"/>
+    <property name="IconThemePath" type="as" access="read"/>
     <method name="GetLayout">
       <arg type="i" direction="in"/><arg type="i" direction="in"/><arg type="as" direction="in"/>
       <arg type="u" direction="out"/><arg type="(ia{{sv}}av)" direction="out"/>
+    </method>
+    <method name="GetGroupProperties">
+      <arg type="ai" direction="in"/><arg type="as" direction="in"/>
+      <arg type="a(ia{{sv}})" direction="out"/>
+    </method>
+    <method name="GetProperty">
+      <arg type="i" direction="in"/><arg type="s" direction="in"/><arg type="v" direction="out"/>
     </method>
     <method name="Event">
       <arg type="i" direction="in"/><arg type="s" direction="in"/>
       <arg type="v" direction="in"/><arg type="u" direction="in"/>
     </method>
+    <method name="EventGroup">
+      <arg type="a(isvu)" direction="in"/><arg type="ai" direction="out"/>
+    </method>
     <method name="AboutToShow"><arg type="i" direction="in"/><arg type="b" direction="out"/></method>
+    <method name="AboutToShowGroup">
+      <arg type="ai" direction="in"/><arg type="ai" direction="out"/><arg type="ai" direction="out"/>
+    </method>
+    <signal name="ItemsPropertiesUpdated">
+      <arg type="a(ia{{sv}})"/><arg type="a(ias)"/>
+    </signal>
     <signal name="LayoutUpdated"><arg type="u"/><arg type="i"/></signal>
+    <signal name="ItemActivationRequested"><arg type="i"/><arg type="u"/></signal>
   </interface>"""
     return f"""<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
  "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
