@@ -618,11 +618,22 @@ class StatusNotifierTray:
             self._reply(new_error(message, "org.freedesktop.DBus.Error.UnknownMethod"))
 
     def _mark_served(self, ident: int, depth: int, revision: int) -> None:
-        """Record that the host now holds `revision` of this item and, for as
-        far as GetLayout recursed, of its descendants."""
-        self._served[ident] = revision
+        """Record whose *children lists* the host now holds at `revision`.
+
+        Only nodes whose children were actually sent count. GetLayout(parent,
+        depth) recurses while depth is non-zero, so a node one level past the
+        limit is delivered as an item - the host learns it exists and that it
+        has a submenu - but its own children are not included.
+
+        Marking those too is what broke nested menus: KDE re-reads the root
+        with GetLayout(0, 1) after any change, which would mark every folder as
+        current while the host still held the previous revision of what is
+        inside them. AboutToShow then said "your copy is fine" and the folder
+        kept showing sessions that had been deleted.
+        """
         if depth == 0:
-            return
+            return  # This node's children were not part of the reply.
+        self._served[ident] = revision
         for child in self._menu.children.get(ident, []):
             self._mark_served(child, depth - 1, revision)
 
