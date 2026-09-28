@@ -305,27 +305,40 @@ class App:
         # folder, so without it the top level becomes unreachable.
         self.tree.bind("<Escape>", lambda e: self.clear_selection())
 
-        self._fix_x11_text_keys()
+        self._fix_text_field_keys()
 
-    def _fix_x11_text_keys(self) -> None:
-        """Give Ctrl+A its Windows meaning in text fields on Linux.
+    def _fix_text_field_keys(self) -> None:
+        """Make Ctrl+A select all in every text field, on every platform.
 
-        Tk maps the <<SelectAll>> virtual event per windowing system: on win32
-        it is Control-slash *and* Control-a, but on x11 it is Control-slash
-        alone (tk.tcl). Nothing else binds Control-a there, so in every entry
-        box - the filter, and every field in the dialogs - Ctrl+A simply does
-        nothing on Linux while it selects all on Windows.
+        Tk wires this differently per windowing system, and differently between
+        Tk releases. On win32 <<SelectAll>> covers Control-a. On x11 it does
+        not, and depending on the Tk build Control-a is instead folded into
+        <<LineStart>>, so Ctrl+A moves the caret to the start of the field -
+        which is what it does on Linux here.
 
-        Adding it to the virtual event rather than binding the widgets means
-        ttk.Entry, tk.Entry and tk.Text all pick it up through the class
-        bindings they already have, including widgets built later by dialogs.
+        Adding Control-a to <<SelectAll>> is not enough to correct that: when a
+        key matches both a virtual and a physical pattern Tk prefers the
+        physical one, and between two virtual patterns the result is not ours
+        to control. Binding the concrete key on the widget classes wins
+        outright, and applies to fields the dialogs create later. Done on all
+        platforms so the behaviour cannot drift apart again.
         """
-        if self.root.tk.call("tk", "windowingsystem") != "x11":
-            return
+        for klass in ("TEntry", "Entry", "TCombobox", "Text"):
+            self.root.bind_class(klass, "<Control-Key-a>", self._select_all_text)
+
+    @staticmethod
+    def _select_all_text(event) -> str:
+        widget = event.widget
         try:
-            self.root.event_add("<<SelectAll>>", "<Control-Key-a>")
+            if widget.winfo_class() == "Text":
+                widget.tag_add("sel", "1.0", "end-1c")
+                widget.mark_set("insert", "1.0")
+            else:
+                widget.selection_range(0, "end")
+                widget.icursor("end")
         except tk.TclError:
-            pass  # Already mapped; nothing to do.
+            pass
+        return "break"
 
     def _typing(self) -> bool:
         """Is focus in a text field, where editing keys outrank accelerators?"""
@@ -575,8 +588,18 @@ class App:
         # no way back to "nothing selected", and since a new node is created
         # inside the selected folder, selecting one folder would leave no way to
         # create anything at the top level again.
-        if not self._drag_id:
+        #
+        # Keyed on the region rather than on identify_row() returning nothing:
+        # a click on a column heading or a separator also has no row, and must
+        # not deselect. "nothing" is the empty area below the last item.
+        if not self._drag_id and self._region_at(event) == "nothing":
             self.clear_selection()
+
+    def _region_at(self, event: tk.Event) -> str:
+        try:
+            return self.tree.identify_region(event.x, event.y)
+        except tk.TclError:
+            return ""
 
     def clear_selection(self) -> None:
         """Deselect everything, so the next new node goes to the top level."""
