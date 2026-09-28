@@ -249,6 +249,15 @@ class Tray:
         return True
 
     def _start_pystray(self) -> bool:
+        # pystray's X11 backend sets HAS_MENU = False ("Menus are not supported
+        # on X"), so on that path the icon has no menu at all - not merely no
+        # submenus. Worth saying out loud rather than presenting a dead icon,
+        # though a click still runs the default action, so it stays usable.
+        self.menu_supported = bool(getattr(pystray.Icon, "HAS_MENU", True))
+        if not self.menu_supported:
+            debug("this pystray backend supports no menu; the icon will only "
+                  "respond to clicks. Install a StatusNotifierItem host "
+                  "(Plasma, or GNOME with the AppIndicator extension) for menus.")
         try:
             self.icon = pystray.Icon(
                 "puttydirectory",

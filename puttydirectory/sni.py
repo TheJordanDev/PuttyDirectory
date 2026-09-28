@@ -106,24 +106,44 @@ class _MenuModel:
         self.children: dict[int, list[int]] = {0: []}
         self.revision = 1
         self._signature = None
+        # Ids must stay the same across rebuilds. A host holds onto the id of
+        # the submenu it is opening, and AboutToShow triggers a rebuild - so
+        # renumbering from a counter each time can hand back a layout in which
+        # that id now means something else, and the submenu opens empty or
+        # wrong. Keying by position in the tree keeps unchanged items stable.
+        self._ids: dict[tuple, int] = {}
+        self._next_id = 1
+
+    def _id_for(self, key: tuple) -> int:
+        ident = self._ids.get(key)
+        if ident is None:
+            ident = self._next_id
+            self._next_id += 1
+            self._ids[key] = ident
+        return ident
 
     def rebuild(self, roots: list[Item]) -> bool:
         """Load a new tree. Returns whether it differs from the last one."""
         items: dict[int, Item] = {}
         children: dict[int, list[int]] = {0: []}
-        counter = [0]
 
-        def walk(nodes: list[Item], parent: int) -> None:
+        def walk(nodes: list[Item], parent: int, path: tuple) -> None:
+            # Disambiguate siblings that share a label, so two sessions of the
+            # same name in different folders still get distinct keys.
+            seen: dict[str, int] = {}
             for node in nodes:
-                counter[0] += 1
-                ident = counter[0]
+                label = "|sep|" if node.separator else node.label
+                occurrence = seen.get(label, 0)
+                seen[label] = occurrence + 1
+                key = path + ((label, occurrence),)
+                ident = self._id_for(key)
                 items[ident] = node
                 children[parent].append(ident)
                 children[ident] = []
                 if node.is_submenu:
-                    walk(node.children or [], ident)
+                    walk(node.children or [], ident, key)
 
-        walk(roots, 0)
+        walk(roots, 0, ())
 
         # Compare by shape and labels: the callables differ on every rebuild
         # (they are freshly made closures), so they cannot be part of the key.
@@ -193,6 +213,10 @@ class StatusNotifierTray:
         self._menu = _MenuModel()
         self._pixmaps: list[tuple[int, int, bytes]] = []
         self._default_action: Optional[Callable[[], None]] = None
+        #: Revision the host last received from GetLayout. AboutToShow compares
+        #: against this to answer "is your copy stale", which is the question
+        #: the host is actually asking.
+        self._served_revision = 0
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -483,6 +507,9 @@ class StatusNotifierTray:
             parent, depth, _names = body
             layout = menu.layout(parent, depth)
             self._reply(new_method_return(message, "u(ia{sv}av)", (menu.revision, layout)))
+            # Remember what the host now holds, so AboutToShow can tell whether
+            # it has fallen behind.
+            self._served_revision = menu.revision
 
         elif member == "GetGroupProperties":
             ids, _names = body
@@ -510,16 +537,33 @@ class StatusNotifierTray:
 
         elif member == "AboutToShow":
             # The host is about to draw the menu - resync it with the directory
-            # so a session added in the window shows up without a restart.
-            changed = self._resync()
-            self._reply(new_method_return(message, "b", (changed,)))
+            # so a folder added in the window shows up without a restart.
+            stale = self._is_stale()
+            self._reply(new_method_return(message, "b", (stale,)))
 
         elif member == "AboutToShowGroup":
-            changed = self._resync()
-            self._reply(new_method_return(message, "aiai", ([], [0] if changed else [])))
+            stale = self._is_stale()
+            self._reply(new_method_return(message, "aiai", ([], [0] if stale else [])))
 
         else:
             self._reply(new_error(message, "org.freedesktop.DBus.Error.UnknownMethod"))
+
+    def _is_stale(self) -> bool:
+        """Has the host's copy of the menu fallen behind ours?
+
+        Not the same question as "did this rebuild change anything". A change
+        made in the window rebuilds the menu straight away, so by the time the
+        host asks, that rebuild reports no further change - and answering with
+        it tells the host its cached layout is still good when it is not. The
+        window's own change would then only appear after some *later* edit
+        happened to land between two menu openings.
+
+        Comparing against the revision last handed out in GetLayout asks the
+        right question, and survives a LayoutUpdated signal the host ignored
+        or never subscribed to.
+        """
+        self._resync()
+        return self._menu.revision != self._served_revision
 
     def _resync(self) -> bool:
         try:
@@ -548,18 +592,45 @@ def _introspection(path: str) -> str:
     <signal name="NewStatus"><arg type="s"/></signal>
   </interface>"""
     else:
+        # Declare everything actually implemented. libdbusmenu reads submenu
+        # item properties with GetGroupProperties and checks the Version
+        # property; a host that introspects first and does not see them can
+        # fall back to older behaviour, which is exactly where nested menus
+        # stop working. An incomplete interface here is a real defect even
+        # when a given host happens not to look.
         body = f"""
   <interface name="{MENU_IFACE}">
+    <property name="Version" type="u" access="read"/>
+    <property name="Status" type="s" access="read"/>
+    <property name="TextDirection" type="s" access="read"/>
+    <property name="IconThemePath" type="as" access="read"/>
     <method name="GetLayout">
       <arg type="i" direction="in"/><arg type="i" direction="in"/><arg type="as" direction="in"/>
       <arg type="u" direction="out"/><arg type="(ia{{sv}}av)" direction="out"/>
+    </method>
+    <method name="GetGroupProperties">
+      <arg type="ai" direction="in"/><arg type="as" direction="in"/>
+      <arg type="a(ia{{sv}})" direction="out"/>
+    </method>
+    <method name="GetProperty">
+      <arg type="i" direction="in"/><arg type="s" direction="in"/><arg type="v" direction="out"/>
     </method>
     <method name="Event">
       <arg type="i" direction="in"/><arg type="s" direction="in"/>
       <arg type="v" direction="in"/><arg type="u" direction="in"/>
     </method>
+    <method name="EventGroup">
+      <arg type="a(isvu)" direction="in"/><arg type="ai" direction="out"/>
+    </method>
     <method name="AboutToShow"><arg type="i" direction="in"/><arg type="b" direction="out"/></method>
+    <method name="AboutToShowGroup">
+      <arg type="ai" direction="in"/><arg type="ai" direction="out"/><arg type="ai" direction="out"/>
+    </method>
+    <signal name="ItemsPropertiesUpdated">
+      <arg type="a(ia{{sv}})"/><arg type="a(ias)"/>
+    </signal>
     <signal name="LayoutUpdated"><arg type="u"/><arg type="i"/></signal>
+    <signal name="ItemActivationRequested"><arg type="i"/><arg type="u"/></signal>
   </interface>"""
     return f"""<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
  "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
