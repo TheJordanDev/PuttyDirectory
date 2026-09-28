@@ -60,6 +60,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="report the tray backend and the menu it would serve")
     parser.add_argument("--ui-dump", action="store_true",
                         help="report Tk's keyboard wiring for this build")
+    parser.add_argument("--tray-probe", action="store_true",
+                        help="drive the tray menu over D-Bus and verify it updates")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser.parse_args(argv)
 
@@ -352,6 +354,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.ui_dump:
         return command_ui_dump()
+
+    if args.tray_probe:
+        from . import trayprobe
+
+        return trayprobe.run()
 
     if args.list or args.connect:
         try:

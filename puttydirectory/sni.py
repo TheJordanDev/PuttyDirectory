@@ -259,7 +259,12 @@ class StatusNotifierTray:
 
     # -- lifecycle ---------------------------------------------------------
 
-    def start(self) -> bool:
+    def start(self, register: bool = True) -> bool:
+        """Serve the icon and menu. ``register`` announces us to the tray host.
+
+        --tray-probe serves without registering: it drives the menu itself over
+        D-Bus, and has no business putting an icon in the panel to do it.
+        """
         if not is_available():
             return False
         try:
@@ -270,13 +275,15 @@ class StatusNotifierTray:
 
             _debug(f"claimed bus name {self._bus_name}")
             self._render()
-            self._watch_for_host_restart()
-            if not self._register():
-                _debug(f"{WATCHER_NAME} refused RegisterStatusNotifierItem")
-                self._close()
-                return False
-            _debug(f"registered with {WATCHER_NAME}; menu has "
-                   f"{len(self._menu.items)} items at revision {self._menu.revision}")
+            if register:
+                self._watch_for_host_restart()
+                if not self._register():
+                    _debug(f"{WATCHER_NAME} refused RegisterStatusNotifierItem")
+                    self._close()
+                    return False
+            _debug(f"serving{' (registered)' if register else ' (unregistered)'}; "
+                   f"menu has {len(self._menu.items)} items "
+                   f"at revision {self._menu.revision}")
         except Exception as error:
             _debug("could not start the SNI tray", error)
             self._close()
@@ -354,11 +361,14 @@ class StatusNotifierTray:
         """Refresh the cached artwork and menu from the factories."""
         pixmaps = []
         for size in ICON_SIZES:
+            # The conversion is inside the guard too: a factory that returns
+            # something unusable is just as survivable as one that raises, and
+            # an icon we cannot draw must not take the whole tray down with it.
             try:
                 image = self.icon_factory(size)
-            except Exception:
-                continue
-            pixmaps.append((size, size, _argb32(image)))
+                pixmaps.append((size, size, _argb32(image)))
+            except Exception as error:
+                _debug(f"could not render the {size}px icon", error)
         self._pixmaps = pixmaps
 
         roots = self.menu_factory()
